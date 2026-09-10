@@ -1,5 +1,5 @@
 // 앱 껍데기(HTML/JS/CSS/폰트)만 캐시한다. 가계부 데이터는 캐시하지 않는다.
-var CACHE = "hh-shell-1.0.0-mtm7s27g";
+var CACHE = "hh-shell-1.0.0-mtvmpxrz";
 var SHELL = ["./", "./index.html", "./app.js", "./styles.css", "./boot.js", "./sw-register.js", "./manifest.json", "./vendor/fonts.css", "./vendor/react.production.min.js", "./vendor/react-dom.production.min.js"];
 
 self.addEventListener("install", function (e) {

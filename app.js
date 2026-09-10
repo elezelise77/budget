@@ -11,16 +11,24 @@ const C = {
 const SERIF = "'Fraunces', 'Source Serif 4', Georgia, serif";
 const SANS = "'Pretendard', 'Inter', system-ui, -apple-system, sans-serif";
 const GEMINI_MODEL = "gemini-3.6-flash";
-// ★ 휴대폰용 웹 주소 ★
-// 이 프로젝트를 GitHub Pages 등에 올린 뒤, 그 주소를 아래에 적어주세요.
-// 예) "https://내아이디.github.io/budget/"
-// 비워두면 설정 화면에 "아직 준비되지 않았습니다" 안내가 표시됩니다.
-const MOBILE_WEB_URL = "";
+// 휴대폰용 웹 주소. 빌드할 때 app.config.json 의 mobileWebUrl 값이 여기에 들어간다.
+// (소스를 직접 고칠 필요 없이 app.config.json 만 수정하면 된다.)
+const MOBILE_WEB_URL = "https://elezelise77.github.io/budget/";
 function mobileLink(pairCode) {
     if (!MOBILE_WEB_URL)
         return "";
     const base = MOBILE_WEB_URL.replace(/#.*$/, "");
     return base + (base.endsWith("/") ? "" : "/") + "#c=" + pairCode;
+}
+// 두 개의 지갑(주머니) 이름. 집집마다 쓰는 말이 달라서 설정에서 바꿀 수 있게 했다.
+const POCKET_DEFAULTS = { living: "생활비 1", incidental: "생활비 2" };
+const PocketNamesCtx = React.createContext(POCKET_DEFAULTS);
+function usePocketNames() {
+    const v = React.useContext(PocketNamesCtx);
+    return {
+        living: (v && typeof v.living === "string" && v.living.trim()) ? v.living : POCKET_DEFAULTS.living,
+        incidental: (v && typeof v.incidental === "string" && v.incidental.trim()) ? v.incidental : POCKET_DEFAULTS.incidental,
+    };
 }
 const EXPENSE_CATS = ["식비", "교통", "주거/관리비", "통신", "문화/여가", "의료/건강", "교육", "쇼핑", "경조사", "품위유지비", "기타"];
 const INCOME_CATS = ["급여", "부수입", "이자/배당", "환급/기타"];
@@ -272,10 +280,12 @@ async function callGeminiDirect(apiKey, model, promptText, base64, mimeType) {
         throw new Error("[EMPTY_TEXT] Gemini가 텍스트를 반환하지 않았습니다.");
     return rawText;
 }
-async function callGeminiWithRetry(apiKey, model, prompt, base64, mimeType) {
+async function callGeminiWithRetry(apiKey, model, prompt, base64, mimeType, onAttempt) {
     let lastErr;
     for (let attempt = 0; attempt <= 2; attempt++) {
         try {
+            if (onAttempt)
+                onAttempt(attempt);
             return await callGeminiDirect(apiKey, model, prompt, base64, mimeType);
         }
         catch (err) {
@@ -471,7 +481,7 @@ async function remoteDelete(cfg, key) {
         method: "POST",
         headers: { "Content-Type": "text/plain;charset=utf-8" },
         body: JSON.stringify({ key: key, action: "delete", token: (cfg && cfg.token) || "" }),
-    }, 20000);
+    }, 90000);
     if (data.error)
         throw new Error(data.error);
     try {
@@ -479,6 +489,58 @@ async function remoteDelete(cfg, key) {
     }
     catch (e) { }
     return true;
+}
+// 시트 내용을 한 번의 요청으로 모두 비운다. 예전 버전 Code.gs 에는 이 기능이 없으므로,
+// 지원하지 않으면 항목별 삭제로 되돌아간다 (느리지만 동작은 한다).
+async function remoteClearAll(cfg, onProgress) {
+    try {
+        const data = await httpJson(withToken(cfg, cfg.apiUrl), {
+            method: "POST",
+            headers: { "Content-Type": "text/plain;charset=utf-8" },
+            body: JSON.stringify({ action: "clearAll", token: (cfg && cfg.token) || "" }),
+        }, 90000);
+        if (data.error)
+            throw new Error(data.error);
+        for (const k of DATA_KEYS) {
+            try {
+                localStorage.removeItem(CACHE_PREFIX + k);
+            }
+            catch (e) { }
+        }
+        return { ok: true, mode: "fast" };
+    }
+    catch (e) {
+        const msg = String((e && e.message) || e);
+        if (msg.indexOf("UNKNOWN_ACTION") === -1)
+            throw e; // 진짜 오류는 그대로 알린다
+        let i = 0;
+        for (const k of DATA_KEYS) {
+            i += 1;
+            if (onProgress)
+                onProgress(i, DATA_KEYS.length);
+            await remoteDelete(cfg, k);
+        }
+        return { ok: true, mode: "slow" };
+    }
+}
+// 모든 항목을 한 번의 요청으로 읽는다. 예전 버전 Code.gs 라면 실패하므로 개별 읽기로 돌아간다.
+async function remoteLoadAllAtOnce(cfg) {
+    const data = await httpJson(withToken(cfg, `${cfg.apiUrl}?action=all`), {}, 30000);
+    if (data.error)
+        throw new Error(data.error);
+    if (!data.values || typeof data.values !== "object")
+        throw new Error("[NO_ALL] 지원하지 않는 저장소 버전");
+    const out = {};
+    for (const k of DATA_KEYS) {
+        const raw = data.values[k];
+        if (raw === undefined || raw === null || raw === "")
+            continue;
+        try {
+            out[k] = JSON.parse(raw);
+        }
+        catch (e) { /* 깨진 값은 건너뛴다 */ }
+    }
+    return out;
 }
 // 이 PC 에 저장된 앱 정보를 모두 지운다 (연결 주소·열쇠·캐시·안내 표시 여부).
 function wipeLocal(keepGeminiKey) {
@@ -507,7 +569,7 @@ async function pingServer(apiUrl, token) {
     return data;
 }
 // ---------- 백업 파일 내보내기 / 가져오기 ----------
-const DATA_KEYS = ["hh-title", "hh-accounts", "hh-transactions", "hh-savings", "hh-insurance", "hh-fixed-expenses", "hh-events", "hh-todos", "hh-budget", "hh-transfers"];
+const DATA_KEYS = ["hh-title", "hh-pockets", "hh-gemini-shared", "hh-accounts", "hh-transactions", "hh-savings", "hh-insurance", "hh-fixed-expenses", "hh-events", "hh-todos", "hh-budget", "hh-transfers"];
 async function exportBackupFile(dataObj) {
     const payload = { app: "우리집 가계부", version: 1, exportedAt: new Date().toISOString(), data: dataObj };
     const text = JSON.stringify(payload, null, 2);
@@ -590,7 +652,7 @@ function DateInput({ value, onChange, style }) {
         onChange(`${ny}-${String(nm).padStart(2, "0")}-${String(dd).padStart(2, "0")}`);
     };
     return (React.createElement("div", { className: "flex gap-1 w-full", style: style },
-        React.createElement(SelectInput, { value: y, onChange: (e) => update(e.target.value, m || "1", d || "1"), style: { flex: "1.2", minWidth: 0, paddingLeft: 6, paddingRight: 2 } },
+        React.createElement(SelectInput, { value: y, onChange: (e) => update(e.target.value, m || "1", d || "1"), style: { flex: "1.9", minWidth: 0, paddingLeft: 6, paddingRight: 2 } },
             React.createElement("option", { value: "" }, "\uB144"),
             years.map((yy) => React.createElement("option", { key: yy, value: yy }, yy))),
         React.createElement(SelectInput, { value: m, onChange: (e) => update(y || String(thisYear), e.target.value, d || "1"), style: { flex: 1, minWidth: 0, paddingLeft: 6, paddingRight: 2 } },
@@ -645,6 +707,7 @@ function BudgetBar({ spent, budget }) {
         React.createElement("div", { className: "h-2.5 rounded-full", style: { width: `${pct}%`, background: over ? C.negative : C.positive, transition: "width 0.6s cubic-bezier(0.16,1,0.3,1)" } }));
 }
 function PocketToggle({ value, onChange }) {
+    const pn = usePocketNames();
     const isIncidental = value === "incidental";
     return (React.createElement("div", { className: "relative inline-flex w-full rounded-full p-1", style: { background: "#EFEAE0" } },
         React.createElement("div", { className: "absolute top-1 bottom-1 rounded-full transition-all duration-250", style: {
@@ -653,8 +716,8 @@ function PocketToggle({ value, onChange }) {
                 background: isIncidental ? C.accent : C.ink,
                 boxShadow: "0 2px 6px -2px rgba(24,26,32,0.35)",
             } }),
-        React.createElement("button", { type: "button", onClick: () => onChange("living"), className: "relative z-10 flex-1 py-2 text-sm font-medium rounded-full transition-colors duration-150", style: { color: isIncidental ? C.inkSoft : "#fff" } }, "\uC0DD\uD65C\uBE44"),
-        React.createElement("button", { type: "button", onClick: () => onChange("incidental"), className: "relative z-10 flex-1 py-2 text-sm font-medium rounded-full transition-colors duration-150", style: { color: isIncidental ? "#fff" : C.inkSoft } }, "\uD488\uC704\uC720\uC9C0\uBE44")));
+        React.createElement("button", { type: "button", onClick: () => onChange("living"), className: "relative z-10 flex-1 py-2 text-sm font-medium rounded-full transition-colors duration-150", style: { color: isIncidental ? C.inkSoft : "#fff" } }, pn.living),
+        React.createElement("button", { type: "button", onClick: () => onChange("incidental"), className: "relative z-10 flex-1 py-2 text-sm font-medium rounded-full transition-colors duration-150", style: { color: isIncidental ? "#fff" : C.inkSoft } }, pn.incidental)));
 }
 // 정렬 토글 버튼 (예: 기본순 / 예금주순 / 종류순)
 function SortToggle({ value, onChange, options }) {
@@ -1133,6 +1196,32 @@ function QrCode({ text, size, caption }) {
             React.createElement("path", { d: cells.join(""), fill: "#181A20" })),
         caption && React.createElement("div", { className: "text-xs mt-1.5 text-center", style: { color: C.muted } }, caption)));
 }
+// ---------- AI 인식 진행 표시 ----------
+// Gemini 는 진행률을 알려주지 않으므로, 지금 어느 단계인지 + 경과 시간을 보여주고
+// 막대는 평소 걸리는 시간을 기준으로 채운다 (끝나기 전에는 92% 에서 멈춘다).
+function AiProgress({ stage, startedAt, expectedMs, note }) {
+    const [now, setNow] = useState(Date.now());
+    useEffect(() => {
+        const id = setInterval(() => setNow(Date.now()), 200);
+        return () => clearInterval(id);
+    }, []);
+    const elapsed = Math.max(0, now - (startedAt || now));
+    const pct = Math.min(92, Math.round((elapsed / (expectedMs || 10000)) * 100));
+    const sec = (elapsed / 1000).toFixed(1);
+    return (React.createElement("div", { className: "rounded-xl p-3.5 mt-3", style: { background: "#FAF9F6", border: `1px solid ${C.border}` } },
+        React.createElement("div", { className: "flex items-center justify-between mb-2 gap-2" },
+            React.createElement("div", { className: "text-sm font-medium flex items-center gap-2", style: { color: C.ink } },
+                React.createElement(IconRefresh, { size: 14, style: { animation: "spin 0.9s linear infinite", color: C.accent } }),
+                stage),
+            React.createElement("div", { className: "text-xs tabular-nums shrink-0", style: { color: C.muted } },
+                pct,
+                "% \u00B7 ",
+                sec,
+                "\uCD08")),
+        React.createElement("div", { className: "h-2 rounded-full overflow-hidden", style: { background: "#EFEAE0" } },
+            React.createElement("div", { className: "h-2 rounded-full", style: { width: `${Math.max(4, pct)}%`, background: C.accent, transition: "width 0.25s linear" } })),
+        React.createElement("div", { className: "text-xs mt-2", style: { color: C.muted } }, note || "보통 5~15초 걸립니다. 창을 닫지 말고 기다려주세요.")));
+}
 // ---------- 자동 넘김 슬라이드 ----------
 function Carousel({ slides, interval }) {
     const [i, setI] = useState(0);
@@ -1275,9 +1364,82 @@ function GeminiGuideModal({ onClose, currentKey, onSave }) {
             React.createElement(Field, { label: "API \uD0A4 \uBD99\uC5EC\uB123\uAE30" },
                 React.createElement("div", { className: "flex gap-2" },
                     React.createElement(TextInput, { type: "password", value: draft, onChange: (e) => setDraft(e.target.value), placeholder: "AIzaSy..." }),
-                    React.createElement(PrimaryBtn, { onClick: () => { const k = draft.trim(); onSave(k); setCopiedMsg(k ? "저장했어요. 이제 생활비관리 탭에서 사진을 올려보세요." : "키를 지웠어요."); } }, "\uC800\uC7A5"))),
+                    React.createElement(PrimaryBtn, { onClick: () => { const k = draft.trim(); onSave(k); setCopiedMsg(k ? "저장했어요. 배우자 기기에도 자동으로 적용됩니다." : "키를 지웠어요."); } }, "\uC800\uC7A5"))),
             copiedMsg && React.createElement("div", { className: "text-xs mt-2", style: { color: C.positive } }, copiedMsg),
-            React.createElement("p", { className: "text-xs mt-3 p-2.5 rounded-lg leading-relaxed", style: { background: "#FAF9F6", border: `1px solid ${C.border}`, color: C.muted } }, "\uD0A4\uB294 \uC774 PC \uC5D0\uB9CC \uC800\uC7A5\uB418\uACE0 \uAD6C\uAE00 \uC2DC\uD2B8\uC5D0\uB294 \uC62C\uB77C\uAC00\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4. \uBC30\uC6B0\uC790 PC \uC5D0\uC11C\uB3C4 \uC4F0\uB824\uBA74 \uADF8\uCABD\uC5D0\uC11C \uAC19\uC740 \uBC29\uBC95\uC73C\uB85C \uD55C \uBC88 \uB354 \uB123\uC5B4\uC8FC\uC138\uC694."))));
+            React.createElement("p", { className: "text-xs mt-3 p-2.5 rounded-lg leading-relaxed", style: { background: "#FAF9F6", border: `1px solid ${C.border}`, color: C.muted } }, "\uD55C \uBC88\uB9CC \uBC1C\uAE09\uBC1B\uC73C\uBA74 \uBC30\uC6B0\uC790 \uAE30\uAE30\uC5D0\uB3C4 \uC790\uB3D9\uC73C\uB85C \uC801\uC6A9\uB429\uB2C8\uB2E4(\uAC19\uC740 \uAC00\uACC4\uBD80\uC5D0 \uC5F0\uACB0\uB41C \uC0AC\uB78C\uB9CC \uBCFC \uC218 \uC788\uC5B4\uC694). \uC6D0\uD558\uC9C0 \uC54A\uC73C\uBA74 \uC124\uC815\uC5D0\uC11C \uACF5\uC720\uB97C \uD574\uC81C\uD560 \uC218 \uC788\uC2B5\uB2C8\uB2E4."))));
+}
+/* 배포 관리 → 새 버전 */
+function MockDeployManage() {
+    return (React.createElement(MockFrame, { title: "Apps Script \u2014 \uBC30\uD3EC \uAD00\uB9AC", w: 360, h: 175 },
+        React.createElement("rect", { x: "0", y: "20", width: "360", height: "18", fill: "#FFFFFF" }),
+        React.createElement("rect", { x: "303", y: "24", width: "34", height: "11", rx: "3", fill: C.accent }),
+        React.createElement("text", { x: "309", y: "32", fontSize: "6.5", fill: "#FFFFFF" }, "\uBC30\uD3EC \u25BE"),
+        React.createElement("rect", { x: "255", y: "40", width: "98", height: "52", rx: "5", fill: "#FFFFFF", stroke: "#E0D9C8" }),
+        React.createElement("text", { x: "264", y: "52", fontSize: "7.5", fill: "#585B66" }, "\uC0C8 \uBC30\uD3EC"),
+        React.createElement("rect", { x: "257", y: "58", width: "94", height: "14", rx: "3", fill: C.accentSoft }),
+        React.createElement("text", { x: "264", y: "68", fontSize: "7.5", fill: C.accentDeep, fontWeight: "700" }, "\uBC30\uD3EC \uAD00\uB9AC"),
+        React.createElement("text", { x: "264", y: "85", fontSize: "7.5", fill: "#585B66" }, "\uD14C\uC2A4\uD2B8 \uBC30\uD3EC"),
+        React.createElement(Pin, { x: 344, y: 22, n: 1 }),
+        React.createElement(Pin, { x: 247, y: 65, n: 2 }),
+        React.createElement("rect", { x: "12", y: "46", width: "215", height: "118", rx: "6", fill: "#FFFFFF", stroke: "#E0D9C8" }),
+        React.createElement("text", { x: "24", y: "62", fontSize: "8", fontWeight: "700", fill: "#181A20" }, "\uBC30\uD3EC \uAD00\uB9AC"),
+        React.createElement("rect", { x: "24", y: "70", width: "150", height: "12", rx: "3", fill: "#F2EFE8" }),
+        React.createElement("text", { x: "30", y: "79", fontSize: "6.5", fill: "#585B66" }, "\uC6F9 \uC571 \u00B7 \uBC84\uC804 1"),
+        React.createElement("circle", { cx: "196", cy: "76", r: "8", fill: "#EFEAE0" }),
+        React.createElement("text", { x: "196", y: "79", fontSize: "8", fill: "#585B66", textAnchor: "middle" }, "\u270E"),
+        React.createElement(Pin, { x: 196, y: 76, n: 3 }),
+        React.createElement("text", { x: "24", y: "100", fontSize: "7", fill: "#9A9CA6" }, "\uBC84\uC804"),
+        React.createElement("rect", { x: "24", y: "105", width: "120", height: "14", rx: "4", fill: "#FAF9F6", stroke: "#E6E0D2" }),
+        React.createElement("text", { x: "32", y: "115", fontSize: "7.5", fill: "#181A20", fontWeight: "600" }, "\uC0C8 \uBC84\uC804"),
+        React.createElement(Pin, { x: 158, y: 112, n: 4 }),
+        React.createElement("rect", { x: "150", y: "138", width: "66", height: "16", rx: "5", fill: C.accent }),
+        React.createElement("text", { x: "183", y: "149", fontSize: "7.5", fill: "#FFFFFF", textAnchor: "middle" }, "\uBC30\uD3EC"),
+        React.createElement(Pin, { x: 135, y: 146, n: 5 })));
+}
+function StorageUpdateModal({ cfg, onClose, onRecheck }) {
+    const [copied, setCopied] = useState(false);
+    const [checking, setChecking] = useState(false);
+    const [msg, setMsg] = useState(null);
+    const code = useMemo(() => APPS_SCRIPT_TEMPLATE.replace("__APP_TOKEN__", (cfg && cfg.token) || "__APP_TOKEN__"), [cfg]);
+    return (React.createElement("div", { className: "fixed inset-0 flex items-center justify-center p-6 z-30", style: { background: "rgba(24,26,32,0.45)" } },
+        React.createElement(Card, { style: { maxWidth: 560, maxHeight: "90vh", overflowY: "auto" }, className: "w-full relative fade-in-up" },
+            React.createElement("div", { className: "flex justify-end" },
+                React.createElement(IconBtn, { onClick: onClose, title: "\uB2EB\uAE30" },
+                    React.createElement(IconX, { size: 16 }))),
+            React.createElement("div", { className: "text-xs tracking-widest mb-1", style: { color: C.accent } }, "\uC800\uC7A5\uC18C \uC5C5\uB370\uC774\uD2B8"),
+            React.createElement("h3", { className: "text-lg font-semibold mb-1", style: { fontFamily: SERIF } }, "\uB354 \uBE60\uB974\uAC8C \uB9CC\uB4E4 \uC218 \uC788\uC5B4\uC694"),
+            React.createElement("p", { className: "text-xs mb-4 leading-relaxed", style: { color: C.muted } },
+                "\uC9C0\uAE08\uB3C4 \uADF8\uB300\uB85C \uC4F8 \uC218 \uC788\uC9C0\uB9CC, \uC800\uC7A5\uC18C \uCF54\uB4DC\uAC00 \uC608\uC804 \uAC83\uC774\uB77C \uB3D9\uAE30\uD654\uAC00 \uB290\uB9AC\uACE0 \uAC00\uB054 ",
+                React.createElement("b", null, "\uC800\uC7A5 \uC2E4\uD328"),
+                "\uAC00 \uB730 \uC218 \uC788\uC2B5\uB2C8\uB2E4. \uC544\uB798\uB300\uB85C \uD55C \uBC88\uB9CC \uBC14\uAFB8\uBA74 \uD6E8\uC52C \uBE68\uB77C\uC9D1\uB2C8\uB2E4. \uAC00\uACC4\uBD80 \uB0B4\uC6A9\uC740 \uADF8\uB300\uB85C \uC720\uC9C0\uB429\uB2C8\uB2E4. (\uC57D 3\uBD84)"),
+            React.createElement("div", { className: "mb-4" },
+                React.createElement(Carousel, { slides: [
+                        { label: "Apps Script 열기", el: React.createElement(MockSheets, null), cap: "가계부가 저장된 구글 스프레드시트를 열고 [확장 프로그램] → [Apps Script] 를 누릅니다." },
+                        { label: "코드 교체", el: React.createElement(MockEditor, null), cap: "Code.gs 편집기에서 Ctrl+A → Delete 로 전부 지우고, 아래 버튼으로 복사한 코드를 Ctrl+V 로 붙여넣은 뒤 Ctrl+S 로 저장합니다." },
+                        { label: "새 버전으로 배포", el: React.createElement(MockDeployManage, null), cap: "[배포] → [배포 관리] → 연필(✎) → 버전을 [새 버전] 으로 바꾸고 [배포] 를 누릅니다." },
+                    ] })),
+            React.createElement("button", { onClick: async () => { const ok = await copyText(code); setCopied(ok); setTimeout(() => setCopied(false), 2000); }, className: "w-full py-2.5 rounded-lg text-sm font-medium mb-2", style: { background: copied ? C.positiveSoft : C.ink, color: copied ? C.positive : "#fff" } }, copied ? "✓ 복사했어요 — 편집기에 Ctrl+V 하세요" : "새 코드 전체 복사하기"),
+            React.createElement("div", { className: "text-xs p-2.5 rounded-lg mb-3 leading-relaxed", style: { background: C.negativeSoft, color: C.negative } },
+                "\uB9C8\uC9C0\uB9C9 \uB2E8\uACC4\uC5D0\uC11C ",
+                React.createElement("b", null, "\uBC18\uB4DC\uC2DC [\uBC30\uD3EC \uAD00\uB9AC] \u2192 \uC5F0\uD544 \u2192 \uC0C8 \uBC84\uC804"),
+                " \uC73C\uB85C \uD558\uC138\uC694. [\uC0C8 \uBC30\uD3EC] \uB85C \uD558\uBA74 \uC8FC\uC18C\uAC00 \uBC14\uB00C\uC5B4 \uC9C0\uAE08 \uC5F0\uACB0\uC774 \uB04A\uC5B4\uC9D1\uB2C8\uB2E4."),
+            React.createElement("button", { onClick: async () => {
+                    setChecking(true);
+                    setMsg(null);
+                    try {
+                        await remoteLoadAllAtOnce(cfg);
+                        setMsg({ ok: true, text: "업데이트 확인! 이제 훨씬 빨라집니다." });
+                        setTimeout(() => { onRecheck(); onClose(); }, 1200);
+                    }
+                    catch (e) {
+                        setMsg({ ok: false, text: "아직 예전 코드입니다. 저장(Ctrl+S)과 [새 버전] 배포까지 했는지 확인해주세요." });
+                    }
+                    finally {
+                        setChecking(false);
+                    }
+                }, disabled: checking, className: "w-full py-2.5 rounded-lg text-sm font-medium", style: { background: C.accentSoft, color: C.accentDeep, opacity: checking ? 0.6 : 1 } }, checking ? "확인 중..." : "다 했어요 — 확인하기"),
+            msg && React.createElement("div", { className: "text-xs mt-2", style: { color: msg.ok ? C.positive : C.negative } }, msg.text),
+            React.createElement("button", { onClick: onClose, className: "w-full py-2 rounded-lg text-sm mt-2", style: { color: C.muted } }, "\uB098\uC911\uC5D0 \uD558\uAE30"))));
 }
 // ---------- 탭별 사용 안내 ----------
 const TAB_GUIDE = [
@@ -1346,165 +1508,7 @@ function HelpModal({ onClose, onGoTab }) {
                     "\uB97C \uAC00\uB054 \uD574\uB450\uBA74 \uC548\uC804\uD569\uB2C8\uB2E4.")))));
 }
 // ---------- 설정(연결) 화면 ----------
-const APPS_SCRIPT_TEMPLATE = String.raw `/**
- * 우리집 가계부 — 개인 저장소 (Google Apps Script)
- *
- * 이 코드는 내 구글 계정 안에서만 동작하며, 데이터는 이 스크립트가 붙어 있는
- * 스프레드시트에만 저장됩니다. 제작자를 포함한 외부에 전송되는 정보는 없습니다.
- *
- * 아래 APP_TOKEN 은 내 가계부 전용 비밀 열쇠입니다. 외부에 공유하지 마세요.
- */
-
-var KV_SHEET = 'KV';
-var CODE_VERSION = 'desktop-1.0';
-var APP_TOKEN = '__APP_TOKEN__';
-
-var MAX_CELL = 45000;      // 시트 셀 1칸 한도(5만자)보다 여유 있게
-var CHUNK_MARK = '__CHUNKED__:';
-
-function getKvSheet_() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName(KV_SHEET);
-  if (!sheet) {
-    sheet = ss.insertSheet(KV_SHEET);
-    sheet.appendRow(['key', 'value', 'updatedAt']);
-  }
-  return sheet;
-}
-
-function keyIndex_(sheet) {
-  var col = sheet.getRange(1, 1, Math.max(sheet.getLastRow(), 1), 1).getValues();
-  var map = {};
-  for (var i = 1; i < col.length; i++) {
-    var k = col[i][0];
-    if (k !== '' && map[k] === undefined) map[k] = i + 1;
-  }
-  return map;
-}
-
-function jsonOut_(obj) {
-  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
-}
-
-function authOk_(token) {
-  if (!APP_TOKEN || APP_TOKEN.indexOf('__APP') === 0) return true;   // 열쇠 미설정 시 통과
-  return String(token || '') === APP_TOKEN;
-}
-
-/* ---------------- 읽기 ---------------- */
-
-function readValue_(sheet, idx, key) {
-  var row = idx[key];
-  if (!row) return null;
-  var v = sheet.getRange(row, 2).getValue();
-  if (typeof v === 'string' && v.indexOf(CHUNK_MARK) === 0) {
-    var n = parseInt(v.substring(CHUNK_MARK.length), 10);
-    var out = '';
-    for (var i = 0; i < n; i++) {
-      var r = idx[key + '#' + i];
-      if (!r) return null;
-      out += sheet.getRange(r, 2).getValue();
-    }
-    return out;
-  }
-  return v;
-}
-
-/* ---------------- 쓰기 ---------------- */
-
-function setRow_(sheet, idx, key, value, now) {
-  var row = idx[key];
-  if (!row) {
-    sheet.appendRow([key, value, now]);
-    idx[key] = sheet.getLastRow();
-  } else {
-    sheet.getRange(row, 2, 1, 2).setValues([[value, now]]);
-  }
-}
-
-function clearChunks_(sheet, idx, key) {
-  var rows = [];
-  for (var k in idx) {
-    if (k.indexOf(key + '#') === 0) rows.push(idx[k]);
-  }
-  rows.sort(function (a, b) { return b - a; });          // 아래쪽부터 지워야 행번호가 안 밀림
-  for (var i = 0; i < rows.length; i++) sheet.deleteRow(rows[i]);
-}
-
-function writeValue_(sheet, key, value) {
-  var idx = keyIndex_(sheet);
-  var now = new Date().toISOString();
-  if (String(value).length > MAX_CELL) {
-    clearChunks_(sheet, idx, key);
-    idx = keyIndex_(sheet);
-    var n = Math.ceil(value.length / MAX_CELL);
-    setRow_(sheet, idx, key, CHUNK_MARK + n, now);
-    for (var i = 0; i < n; i++) setRow_(sheet, idx, key + '#' + i, value.substr(i * MAX_CELL, MAX_CELL), now);
-  } else {
-    var had = idx[key] ? sheet.getRange(idx[key], 2).getValue() : '';
-    if (typeof had === 'string' && had.indexOf(CHUNK_MARK) === 0) {
-      clearChunks_(sheet, idx, key);
-      idx = keyIndex_(sheet);
-    }
-    setRow_(sheet, idx, key, value, now);
-  }
-}
-
-/* ---------------- 엔드포인트 ---------------- */
-
-function doGet(e) {
-  var p = (e && e.parameter) || {};
-  if (!authOk_(p.t)) return jsonOut_({ error: '[AUTH] 접근 권한이 없습니다. 앱의 연결코드를 확인해주세요.' });
-  if (p.action === 'ping') return jsonOut_({ ok: true, version: CODE_VERSION, time: new Date().toISOString() });
-
-  var sheet = getKvSheet_();
-  var idx = keyIndex_(sheet);
-  if (p.action === 'list') {
-    var keys = [];
-    for (var k in idx) if (k.indexOf('#') === -1) keys.push(k);
-    return jsonOut_({ keys: keys });
-  }
-  if (p.key) return jsonOut_({ key: p.key, value: readValue_(sheet, idx, p.key) });
-  return jsonOut_({ error: 'no key or action' });
-}
-
-function doPost(e) {
-  var body;
-  try {
-    body = JSON.parse(e.postData.contents);
-  } catch (err) {
-    return jsonOut_({ error: '[BODY_PARSE_FAIL] ' + String(err) });
-  }
-  var qs = (e && e.parameter) || {};
-  if (!authOk_(body.token || qs.t)) return jsonOut_({ error: '[AUTH] 접근 권한이 없습니다.' });
-  if (body.action !== 'set' && body.action !== 'delete') {
-    return jsonOut_({ error: '[UNKNOWN_ACTION] ' + JSON.stringify(body.action) });
-  }
-
-  var sheet = getKvSheet_();
-  var lock = LockService.getScriptLock();
-  try {
-    lock.waitLock(20000);
-  } catch (lockErr) {
-    return jsonOut_({ error: '[LOCK_TIMEOUT] 다른 기기가 저장 중입니다. 잠시 후 다시 시도해주세요.' });
-  }
-  try {
-    if (body.action === 'delete') {
-      var idx = keyIndex_(sheet);
-      clearChunks_(sheet, idx, body.key);
-      idx = keyIndex_(sheet);
-      if (idx[body.key]) sheet.deleteRow(idx[body.key]);
-      return jsonOut_({ ok: true });
-    }
-    writeValue_(sheet, body.key, String(body.value));
-    return jsonOut_({ ok: true });
-  } catch (writeErr) {
-    return jsonOut_({ error: '[WRITE_ERROR] ' + String(writeErr.message || writeErr) });
-  } finally {
-    lock.releaseLock();
-  }
-}
-`;
+const APPS_SCRIPT_TEMPLATE = "/**\n * 우리집 가계부 — 개인 저장소 (Google Apps Script)\n *\n * 이 코드는 내 구글 계정 안에서만 동작하며, 데이터는 이 스크립트가 붙어 있는\n * 스프레드시트에만 저장됩니다. 제작자를 포함한 외부에 전송되는 정보는 없습니다.\n *\n * 아래 APP_TOKEN 은 내 가계부 전용 비밀 열쇠입니다. 외부에 공유하지 마세요.\n */\n\nvar KV_SHEET = 'KV';\nvar CODE_VERSION = 'desktop-1.1';\nvar APP_TOKEN = '__APP_TOKEN__';\n\nvar MAX_CELL = 45000;      // 시트 셀 1칸 한도(5만자)보다 여유 있게\nvar CHUNK_MARK = '__CHUNKED__:';\n\nfunction getKvSheet_() {\n  var ss = SpreadsheetApp.getActiveSpreadsheet();\n  var sheet = ss.getSheetByName(KV_SHEET);\n  if (!sheet) {\n    sheet = ss.insertSheet(KV_SHEET);\n    sheet.appendRow(['key', 'value', 'updatedAt']);\n  }\n  return sheet;\n}\n\nfunction keyIndex_(sheet) {\n  var col = sheet.getRange(1, 1, Math.max(sheet.getLastRow(), 1), 1).getValues();\n  var map = {};\n  for (var i = 1; i < col.length; i++) {\n    var k = col[i][0];\n    if (k !== '' && map[k] === undefined) map[k] = i + 1;\n  }\n  return map;\n}\n\nfunction jsonOut_(obj) {\n  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);\n}\n\nfunction authOk_(token) {\n  if (!APP_TOKEN || APP_TOKEN.indexOf('__APP') === 0) return true;   // 열쇠 미설정 시 통과\n  return String(token || '') === APP_TOKEN;\n}\n\n/* ---------------- 읽기 ---------------- */\n\nfunction readValue_(sheet, idx, key) {\n  var row = idx[key];\n  if (!row) return null;\n  var v = sheet.getRange(row, 2).getValue();\n  if (typeof v === 'string' && v.indexOf(CHUNK_MARK) === 0) {\n    var n = parseInt(v.substring(CHUNK_MARK.length), 10);\n    var out = '';\n    for (var i = 0; i < n; i++) {\n      var r = idx[key + '#' + i];\n      if (!r) return null;\n      out += sheet.getRange(r, 2).getValue();\n    }\n    return out;\n  }\n  return v;\n}\n\n/* ---------------- 쓰기 ---------------- */\n\nfunction setRow_(sheet, idx, key, value, now) {\n  var row = idx[key];\n  if (!row) {\n    sheet.appendRow([key, value, now]);\n    idx[key] = sheet.getLastRow();\n  } else {\n    sheet.getRange(row, 2, 1, 2).setValues([[value, now]]);\n  }\n}\n\nfunction clearChunks_(sheet, idx, key) {\n  var rows = [];\n  for (var k in idx) {\n    if (k.indexOf(key + '#') === 0) rows.push(idx[k]);\n  }\n  rows.sort(function (a, b) { return b - a; });          // 아래쪽부터 지워야 행번호가 안 밀림\n  for (var i = 0; i < rows.length; i++) sheet.deleteRow(rows[i]);\n}\n\nfunction writeValue_(sheet, key, value) {\n  var idx = keyIndex_(sheet);\n  var now = new Date().toISOString();\n  if (String(value).length > MAX_CELL) {\n    clearChunks_(sheet, idx, key);\n    idx = keyIndex_(sheet);\n    var n = Math.ceil(value.length / MAX_CELL);\n    setRow_(sheet, idx, key, CHUNK_MARK + n, now);\n    for (var i = 0; i < n; i++) setRow_(sheet, idx, key + '#' + i, value.substr(i * MAX_CELL, MAX_CELL), now);\n  } else {\n    var had = idx[key] ? sheet.getRange(idx[key], 2).getValue() : '';\n    if (typeof had === 'string' && had.indexOf(CHUNK_MARK) === 0) {\n      clearChunks_(sheet, idx, key);\n      idx = keyIndex_(sheet);\n    }\n    setRow_(sheet, idx, key, value, now);\n  }\n}\n\n/* ---------------- 엔드포인트 ---------------- */\n\nfunction doGet(e) {\n  var p = (e && e.parameter) || {};\n  if (!authOk_(p.t)) return jsonOut_({ error: '[AUTH] 접근 권한이 없습니다. 앱의 연결코드를 확인해주세요.' });\n  if (p.action === 'ping') return jsonOut_({ ok: true, version: CODE_VERSION, time: new Date().toISOString() });\n\n  var sheet = getKvSheet_();\n  var idx = keyIndex_(sheet);\n  if (p.action === 'list') {\n    var keys = [];\n    for (var k in idx) if (k.indexOf('#') === -1) keys.push(k);\n    return jsonOut_({ keys: keys });\n  }\n  if (p.action === 'all') {\n    // 항목마다 따로 부르면 요청이 10번 나가 느리므로, 한 번에 모두 돌려준다.\n    var out = {};\n    for (var kk in idx) {\n      if (kk.indexOf('#') !== -1) continue;\n      out[kk] = readValue_(sheet, idx, kk);\n    }\n    return jsonOut_({ values: out });\n  }\n  if (p.key) return jsonOut_({ key: p.key, value: readValue_(sheet, idx, p.key) });\n  return jsonOut_({ error: 'no key or action' });\n}\n\nfunction doPost(e) {\n  var body;\n  try {\n    body = JSON.parse(e.postData.contents);\n  } catch (err) {\n    return jsonOut_({ error: '[BODY_PARSE_FAIL] ' + String(err) });\n  }\n  var qs = (e && e.parameter) || {};\n  if (!authOk_(body.token || qs.t)) return jsonOut_({ error: '[AUTH] 접근 권한이 없습니다.' });\n  if (body.action !== 'set' && body.action !== 'delete' && body.action !== 'clearAll') {\n    return jsonOut_({ error: '[UNKNOWN_ACTION] ' + JSON.stringify(body.action) });\n  }\n\n  var sheet = getKvSheet_();\n  var lock = LockService.getScriptLock();\n  try {\n    lock.waitLock(20000);\n  } catch (lockErr) {\n    return jsonOut_({ error: '[LOCK_TIMEOUT] 다른 기기가 저장 중입니다. 잠시 후 다시 시도해주세요.' });\n  }\n  try {\n    if (body.action === 'clearAll') {\n      // 데이터 행을 통째로 한 번에 지운다 (한 줄씩 지우면 매우 느리다).\n      var last = sheet.getLastRow();\n      if (last > 1) sheet.deleteRows(2, last - 1);\n      return jsonOut_({ ok: true, cleared: Math.max(0, last - 1) });\n    }\n    if (body.action === 'delete') {\n      var idx = keyIndex_(sheet);\n      clearChunks_(sheet, idx, body.key);\n      idx = keyIndex_(sheet);\n      if (idx[body.key]) sheet.deleteRow(idx[body.key]);\n      return jsonOut_({ ok: true });\n    }\n    writeValue_(sheet, body.key, String(body.value));\n    return jsonOut_({ ok: true });\n  } catch (writeErr) {\n    return jsonOut_({ error: '[WRITE_ERROR] ' + String(writeErr.message || writeErr) });\n  } finally {\n    lock.releaseLock();\n  }\n}\n"; // 빌드할 때 apps-script/Code.gs 내용이 들어간다
 function genToken() {
     const bytes = new Uint8Array(18);
     (window.crypto || window.msCrypto).getRandomValues(bytes);
@@ -1788,6 +1792,7 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
     const [showHelp, setShowHelp] = useState(false);
     const [showGemini, setShowGemini] = useState(false);
     const [titleDraft, setTitleDraft] = useState("");
+    const [pocketDraft, setPocketDraft] = useState(POCKET_DEFAULTS);
     const [resetMode, setResetMode] = useState(null);
     const [resetBusy, setResetBusy] = useState(false);
     const [resetMsg, setResetMsg] = useState(null);
@@ -1795,12 +1800,15 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
     const [ioMsg, setIoMsg] = useState(null);
     const [pairCopied, setPairCopied] = useState(false);
     const [mobileCopied, setMobileCopied] = useState(false);
+    const [storageOld, setStorageOld] = useState(false);
+    const [showUpdate, setShowUpdate] = useState(false);
     const pairCode = useMemo(() => makePairCode(cfg.apiUrl, cfg.token), [cfg.apiUrl, cfg.token]);
     const doExport = async () => {
         setIoMsg(null);
         try {
             const snap = {
                 "hh-title": title,
+                "hh-pockets": pockets,
                 "hh-accounts": accounts, "hh-transactions": transactions, "hh-savings": savings,
                 "hh-insurance": insurances, "hh-fixed-expenses": fixedExpenses, "hh-events": events,
                 "hh-todos": todos, "hh-budget": budgets, "hh-transfers": transfers,
@@ -1843,6 +1851,8 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
             setTransfers(pick("hh-transfers", []));
             if (typeof d["hh-title"] === "string" && d["hh-title"].trim())
                 setTitle(d["hh-title"]);
+            if (d["hh-pockets"] && typeof d["hh-pockets"] === "object")
+                setPockets({ ...POCKET_DEFAULTS, ...d["hh-pockets"] });
             setIoMsg({ ok: true, text: "복원했어요. 구글 시트에도 반영 중입니다." });
         }
         catch (e) {
@@ -1860,6 +1870,8 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
     const [budgets, setBudgets] = useState({});
     const [transfers, setTransfers] = useState([]);
     const [title, setTitle] = useState("우리집 가계부");
+    const [pockets, setPockets] = useState(POCKET_DEFAULTS); // 두 지갑의 이름 (부부 공유)
+    const [sharedGemini, setSharedGemini] = useState(""); // 배우자와 함께 쓰는 AI 키
     // 서버에 실제로 들어있는 값(문자열). 이 값과 같으면 다시 저장하지 않는다.
     // 예전에는 20초마다 데이터를 다시 불러올 때마다 9개 항목을 전부 재저장해서
     // 구글 시트 잠금이 겹치고 "저장 실패"가 뜨는 문제가 있었다.
@@ -1871,29 +1883,86 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
         if (showSpinner)
             setSyncing(true);
         try {
-            const [ttl, a, t, s, ins, fx, e, td, bg, tr] = await Promise.all([
-                remoteLoad(cfg, "hh-title", "우리집 가계부"),
-                remoteLoad(cfg, "hh-accounts", []),
-                remoteLoad(cfg, "hh-transactions", []),
-                remoteLoad(cfg, "hh-savings", []),
-                remoteLoad(cfg, "hh-insurance", []),
-                remoteLoad(cfg, "hh-fixed-expenses", []),
-                remoteLoad(cfg, "hh-events", []),
-                remoteLoad(cfg, "hh-todos", []),
-                remoteLoad(cfg, "hh-budget", {}),
-                remoteLoad(cfg, "hh-transfers", []),
-            ]);
+            // 요청을 10번 보내면 구글 시트가 밀리므로 한 번에 받아오고, 안 되면 예전 방식으로.
+            let bulk = null;
+            try {
+                bulk = await remoteLoadAllAtOnce(cfg);
+                setStorageOld(false);
+            }
+            catch (bulkErr) {
+                bulk = null;
+                // 인터넷 문제가 아니라 "이 기능을 모르는 예전 코드" 일 때만 안내를 띄운다.
+                const m = String((bulkErr && bulkErr.message) || "");
+                if (/NO_ALL|no key or action|UNKNOWN/i.test(m))
+                    setStorageOld(true);
+            }
+            let ttl, a, t, s, ins, fx, e, td, bg, tr, pk, gk;
+            if (bulk) {
+                for (const k of DATA_KEYS)
+                    if (bulk[k] !== undefined)
+                        cacheSet(k, bulk[k]);
+                ttl = bulk["hh-title"];
+                a = bulk["hh-accounts"];
+                t = bulk["hh-transactions"];
+                s = bulk["hh-savings"];
+                ins = bulk["hh-insurance"];
+                fx = bulk["hh-fixed-expenses"];
+                e = bulk["hh-events"];
+                td = bulk["hh-todos"];
+                bg = bulk["hh-budget"];
+                tr = bulk["hh-transfers"];
+                pk = bulk["hh-pockets"];
+                gk = bulk["hh-gemini-shared"];
+            }
+            else {
+                [ttl, a, t, s, ins, fx, e, td, bg, tr] = await Promise.all([
+                    remoteLoad(cfg, "hh-title", "우리집 가계부"),
+                    remoteLoad(cfg, "hh-accounts", []),
+                    remoteLoad(cfg, "hh-transactions", []),
+                    remoteLoad(cfg, "hh-savings", []),
+                    remoteLoad(cfg, "hh-insurance", []),
+                    remoteLoad(cfg, "hh-fixed-expenses", []),
+                    remoteLoad(cfg, "hh-events", []),
+                    remoteLoad(cfg, "hh-todos", []),
+                    remoteLoad(cfg, "hh-budget", {}),
+                    remoteLoad(cfg, "hh-transfers", []),
+                ]);
+                try {
+                    pk = await remoteLoad(cfg, "hh-pockets", null);
+                }
+                catch (e2) {
+                    pk = null;
+                }
+                try {
+                    gk = await remoteLoad(cfg, "hh-gemini-shared", "");
+                }
+                catch (e2) {
+                    gk = "";
+                }
+            }
             const safeTitle = typeof ttl === "string" && ttl.trim() ? ttl : "우리집 가계부";
-            const bgObj = bg && typeof bg === "object" ? bg : {};
+            const safePockets = {
+                living: (pk && typeof pk.living === "string" && pk.living.trim()) ? pk.living : POCKET_DEFAULTS.living,
+                incidental: (pk && typeof pk.incidental === "string" && pk.incidental.trim()) ? pk.incidental : POCKET_DEFAULTS.incidental,
+            };
+            const safeGemini = typeof gk === "string" ? gk : "";
+            const bgObj = bg && typeof bg === "object" && !Array.isArray(bg) ? bg : {};
             const next = {
                 "hh-title": safeTitle, "hh-accounts": a || [], "hh-transactions": t || [], "hh-savings": s || [],
                 "hh-insurance": ins || [], "hh-fixed-expenses": fx || [], "hh-events": e || [],
                 "hh-todos": td || [], "hh-budget": bgObj, "hh-transfers": tr || [],
             };
             // 상태를 바꾸기 전에 스냅샷을 먼저 기록해야 저장 이펙트가 헛돌지 않는다.
+            next["hh-pockets"] = safePockets;
+            next["hh-gemini-shared"] = safeGemini;
             for (const k of DATA_KEYS)
                 serverSnap.current[k] = JSON.stringify(next[k]);
             setTitle(safeTitle);
+            setPockets(safePockets);
+            setSharedGemini(safeGemini);
+            // 배우자가 공유해 둔 키가 있고 이 PC 에 키가 없으면 그대로 가져다 쓴다.
+            if (safeGemini && !cfg.geminiKey)
+                onSaveGeminiKey(safeGemini);
             setAccounts(next["hh-accounts"]);
             setTransactions(next["hh-transactions"]);
             setSavings(next["hh-savings"]);
@@ -1913,6 +1982,13 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
                 const ca = c("hh-accounts", []), ct = c("hh-transactions", []);
                 const cachedTitle = c("hh-title", "우리집 가계부").value;
                 setTitle(typeof cachedTitle === "string" && cachedTitle.trim() ? cachedTitle : "우리집 가계부");
+                const cachedGk = c("hh-gemini-shared", "").value;
+                setSharedGemini(typeof cachedGk === "string" ? cachedGk : "");
+                const cachedPk = c("hh-pockets", POCKET_DEFAULTS).value;
+                setPockets({
+                    living: (cachedPk && typeof cachedPk.living === "string" && cachedPk.living.trim()) ? cachedPk.living : POCKET_DEFAULTS.living,
+                    incidental: (cachedPk && typeof cachedPk.incidental === "string" && cachedPk.incidental.trim()) ? cachedPk.incidental : POCKET_DEFAULTS.incidental,
+                });
                 setAccounts(ca.value);
                 setTransactions(ct.value);
                 setSavings(c("hh-savings", []).value);
@@ -1925,8 +2001,10 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
                 setTransfers(c("hh-transfers", []).value);
                 // 오프라인에서 화면을 캐시로 채운 것 자체가 "변경"으로 오해되어
                 // 곧바로 저장을 시도하지 않도록, 스냅샷을 화면에 올린 값과 똑같이 맞춰 둔다.
-                for (const k of DATA_KEYS)
-                    serverSnap.current[k] = JSON.stringify(cacheGet(k, k === "hh-budget" ? {} : k === "hh-title" ? "우리집 가계부" : []).value);
+                for (const k of DATA_KEYS) {
+                    const fb = k === "hh-budget" ? {} : k === "hh-title" ? "우리집 가계부" : k === "hh-pockets" ? POCKET_DEFAULTS : k === "hh-gemini-shared" ? "" : [];
+                    serverSnap.current[k] = JSON.stringify(cacheGet(k, fb).value);
+                }
             }
             // 화면을 이미 띄운 뒤에 연결이 끊겨도 같은 안내를 유지한다.
             const at = cacheGet("hh-transactions", []).at || cacheGet("hh-accounts", []).at;
@@ -1980,6 +2058,10 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
     useEffect(() => { if (!loaded)
         return; safeSave("hh-title", title); }, [title]);
     useEffect(() => { if (!loaded)
+        return; safeSave("hh-pockets", pockets); }, [pockets]);
+    useEffect(() => { if (!loaded)
+        return; safeSave("hh-gemini-shared", sharedGemini); }, [sharedGemini]);
+    useEffect(() => { if (!loaded)
         return; safeSave("hh-accounts", accounts); }, [accounts]);
     useEffect(() => { if (!loaded)
         return; safeSave("hh-transactions", transactions); }, [transactions]);
@@ -2010,8 +2092,9 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
     if (!loaded)
         return React.createElement("div", { className: "min-h-screen flex items-center justify-center", style: { background: C.bg, color: C.muted, fontFamily: SANS } }, "\uBD88\uB7EC\uC624\uB294 \uC911...");
     const currentLabel = NAV.find((n) => n.id === tab)?.label;
-    return (React.createElement("div", { className: "min-h-screen flex", style: { background: C.bg, color: C.ink, fontFamily: SANS, backgroundImage: `radial-gradient(circle at 15% -10%, ${C.accentSoft}55, transparent 45%), radial-gradient(circle at 100% 0%, ${C.bgAlt}88, transparent 50%)` } },
-        React.createElement("style", null, `
+    return (React.createElement(PocketNamesCtx.Provider, { value: pockets },
+        React.createElement("div", { className: "min-h-screen flex", style: { background: C.bg, color: C.ink, fontFamily: SANS, backgroundImage: `radial-gradient(circle at 15% -10%, ${C.accentSoft}55, transparent 45%), radial-gradient(circle at 100% 0%, ${C.bgAlt}88, transparent 50%)` } },
+            React.createElement("style", null, `
         .lift-card:hover { transform: translateY(-3px); box-shadow: ${C.shadowLift}; }
         .focus-ring:focus { border-color: ${C.accent} !important; box-shadow: 0 0 0 3px ${C.accentSoft}; }
         .nav-btn { position: relative; overflow: hidden; }
@@ -2019,136 +2102,156 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
         .nav-btn:hover .nav-icon { transform: translateX(2px); }
         .desktop-wrap { max-width: 1440px; margin: 0 auto; width: 100%; }
       `),
-        React.createElement("aside", { className: "hidden md:flex md:flex-col w-64 shrink-0 p-5", style: { borderRight: `1px solid ${C.border}` } },
-            React.createElement("div", { className: "mb-8 px-2" },
-                React.createElement("div", { className: "text-2xl font-semibold", style: { fontFamily: SERIF, letterSpacing: "-0.01em", wordBreak: "keep-all" } }, title)),
-            React.createElement("nav", { className: "flex flex-col gap-1" }, NAV.map((n) => {
+            React.createElement("aside", { className: "hidden md:flex md:flex-col w-64 shrink-0 p-5", style: { borderRight: `1px solid ${C.border}` } },
+                React.createElement("div", { className: "mb-8 px-2" },
+                    React.createElement("div", { className: "text-2xl font-semibold", style: { fontFamily: SERIF, letterSpacing: "-0.01em", wordBreak: "keep-all" } }, title)),
+                React.createElement("nav", { className: "flex flex-col gap-1" }, NAV.map((n) => {
+                    const IconComp = n.icon;
+                    const active = tab === n.id;
+                    return (React.createElement("button", { key: n.id, onClick: () => setTab(n.id), className: "nav-btn flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 text-left", style: { background: active ? C.ink : "transparent", color: active ? "#fff" : C.inkSoft, boxShadow: active ? "0 4px 12px -4px rgba(24,26,32,0.4)" : "none" } },
+                        React.createElement(IconComp, { size: 17, className: "nav-icon" }),
+                        n.label));
+                })),
+                React.createElement("div", { className: "mt-auto px-2 pt-6 text-xs", style: { color: C.muted } },
+                    "\uCD1D \uC790\uC0B0 ",
+                    React.createElement("span", { style: { fontFamily: SERIF, color: C.ink, fontWeight: 600 } },
+                        React.createElement(AnimatedNumber, { value: totalAssets })))),
+            React.createElement("div", { className: "flex-1 flex flex-col min-w-0 pb-16 md:pb-0" },
+                React.createElement("header", { className: "px-4 md:px-8 py-4 md:py-5 flex items-center justify-between gap-3", style: { borderBottom: `1px solid ${C.border}` } },
+                    React.createElement("div", { className: "desktop-wrap flex items-center justify-between gap-3" },
+                        React.createElement("h1", { className: "text-xl md:text-3xl font-semibold shrink-0", style: { fontFamily: SERIF } }, currentLabel),
+                        React.createElement("div", { className: "flex items-center gap-2 md:gap-3 min-w-0" },
+                            syncError ? (React.createElement("div", { className: "flex items-center gap-1 text-xs shrink-0", style: { color: C.negative } },
+                                React.createElement(IconWifiOff, { size: 13 }),
+                                " ",
+                                React.createElement("span", { className: "hidden sm:inline" }, syncError))) : (React.createElement("div", { className: "text-xs hidden sm:block shrink-0", style: { color: C.muted } }, lastSynced ? `${lastSynced.toLocaleTimeString("ko-KR")} 동기화됨` : "")),
+                            React.createElement(IconBtn, { onClick: () => reloadAll(true), title: "\uC0C8\uB85C\uACE0\uCE68" },
+                                React.createElement(IconRefresh, { size: 16, style: { animation: syncing ? "spin 0.8s linear infinite" : "none" } })),
+                            React.createElement(IconBtn, { onClick: () => setShowHelp(true), title: "\uC0AC\uC6A9 \uC548\uB0B4" },
+                                React.createElement(IconHelp, { size: 16 })),
+                            React.createElement(IconBtn, { onClick: () => { setTitleDraft(title); setPocketDraft(pockets); setShowSettings(true); }, title: "\uC5F0\uACB0 \uC124\uC815" },
+                                React.createElement(IconSettings, { size: 16 }))))),
+                React.createElement("main", { key: tab, className: "flex-1 min-w-0 p-4 md:p-8 overflow-y-auto fade-in-up" },
+                    React.createElement("div", { className: "desktop-wrap" },
+                        storageOld && (React.createElement("div", { className: "rounded-xl p-3 mb-4 flex items-center justify-between gap-3 flex-wrap", style: { background: C.accentSoft, border: `1px solid ${C.accent}` } },
+                            React.createElement("div", { className: "text-sm", style: { color: C.accentDeep } },
+                                React.createElement("b", null, "\uC800\uC7A5\uC18C\uB97C \uC5C5\uB370\uC774\uD2B8\uD558\uBA74 \uB354 \uBE68\uB77C\uC9D1\uB2C8\uB2E4."),
+                                " \uC9C0\uAE08\uB3C4 \uC4F8 \uC218 \uC788\uC9C0\uB9CC \uB3D9\uAE30\uD654\uAC00 \uB290\uB9AC\uACE0 \uC800\uC7A5 \uC2E4\uD328\uAC00 \uC0DD\uAE38 \uC218 \uC788\uC5B4\uC694."),
+                            React.createElement("button", { onClick: () => setShowUpdate(true), className: "px-3 py-2 rounded-lg text-sm font-medium shrink-0", style: { background: C.accent, color: "#fff" } }, "3\uBD84\uB9CC\uC5D0 \uC5C5\uB370\uC774\uD2B8\uD558\uAE30"))),
+                        tab === "dashboard" && React.createElement(Dashboard, { transactions: transactions, savings: savings, events: events, todos: todos, budgets: budgets, totalSavingsCurrent: totalSavingsCurrent }),
+                        tab === "savings" && React.createElement(SavingsInvestTab, { savings: savings, setSavings: setSavings, accounts: accounts }),
+                        tab === "insurance" && React.createElement(FixedCostsTab, { insurances: insurances, setInsurances: setInsurances, fixedExpenses: fixedExpenses, setFixedExpenses: setFixedExpenses, accounts: accounts }),
+                        tab === "expenses" && React.createElement(ExpensesTab, { transactions: transactions, addTransaction: addTransaction, addTransactions: addTransactions, deleteTransaction: deleteTransaction, updateTransaction: updateTransaction, cfg: cfg, onOpenSettings: () => setShowGemini(true), budgets: budgets, setBudgetForPeriod: setBudgetForPeriod }),
+                        tab === "calendar" && React.createElement(CalendarTab, { events: events, setEvents: setEvents }),
+                        tab === "todo" && React.createElement(TodoTab, { todos: todos, setTodos: setTodos }),
+                        tab === "accounts" && React.createElement(AccountsTab, { accounts: accounts, setAccounts: setAccounts, transfers: transfers, setTransfers: setTransfers, insurances: insurances, fixedExpenses: fixedExpenses, savings: savings })))),
+            React.createElement("nav", { className: "md:hidden fixed bottom-0 left-0 right-0 flex z-10", style: { background: C.surface, borderTop: `1px solid ${C.border}`, boxShadow: "0 -4px 16px rgba(24,26,32,0.06)", paddingBottom: "env(safe-area-inset-bottom, 0px)" } }, NAV.map((n) => {
                 const IconComp = n.icon;
                 const active = tab === n.id;
-                return (React.createElement("button", { key: n.id, onClick: () => setTab(n.id), className: "nav-btn flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 text-left", style: { background: active ? C.ink : "transparent", color: active ? "#fff" : C.inkSoft, boxShadow: active ? "0 4px 12px -4px rgba(24,26,32,0.4)" : "none" } },
-                    React.createElement(IconComp, { size: 17, className: "nav-icon" }),
-                    n.label));
+                return (React.createElement("button", { key: n.id, onClick: () => setTab(n.id), className: "flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 py-2 transition-transform duration-150", style: { transform: active ? "translateY(-2px)" : "none" } },
+                    React.createElement(IconComp, { size: 18, color: active ? C.ink : C.muted }),
+                    React.createElement("span", { className: "text-[9.5px] leading-tight truncate w-full text-center px-0.5", style: { color: active ? C.ink : C.muted, fontWeight: active ? 600 : 400 } }, n.shortLabel)));
             })),
-            React.createElement("div", { className: "mt-auto px-2 pt-6 text-xs", style: { color: C.muted } },
-                "\uCD1D \uC790\uC0B0 ",
-                React.createElement("span", { style: { fontFamily: SERIF, color: C.ink, fontWeight: 600 } },
-                    React.createElement(AnimatedNumber, { value: totalAssets })))),
-        React.createElement("div", { className: "flex-1 flex flex-col min-w-0 pb-16 md:pb-0" },
-            React.createElement("header", { className: "px-4 md:px-8 py-4 md:py-5 flex items-center justify-between gap-3", style: { borderBottom: `1px solid ${C.border}` } },
-                React.createElement("div", { className: "desktop-wrap flex items-center justify-between gap-3" },
-                    React.createElement("h1", { className: "text-xl md:text-3xl font-semibold shrink-0", style: { fontFamily: SERIF } }, currentLabel),
-                    React.createElement("div", { className: "flex items-center gap-2 md:gap-3 min-w-0" },
-                        syncError ? (React.createElement("div", { className: "flex items-center gap-1 text-xs shrink-0", style: { color: C.negative } },
-                            React.createElement(IconWifiOff, { size: 13 }),
-                            " ",
-                            React.createElement("span", { className: "hidden sm:inline" }, syncError))) : (React.createElement("div", { className: "text-xs hidden sm:block shrink-0", style: { color: C.muted } }, lastSynced ? `${lastSynced.toLocaleTimeString("ko-KR")} 동기화됨` : "")),
-                        React.createElement(IconBtn, { onClick: () => reloadAll(true), title: "\uC0C8\uB85C\uACE0\uCE68" },
-                            React.createElement(IconRefresh, { size: 16, style: { animation: syncing ? "spin 0.8s linear infinite" : "none" } })),
-                        React.createElement(IconBtn, { onClick: () => setShowHelp(true), title: "\uC0AC\uC6A9 \uC548\uB0B4" },
-                            React.createElement(IconHelp, { size: 16 })),
-                        React.createElement(IconBtn, { onClick: () => { setTitleDraft(title); setShowSettings(true); }, title: "\uC5F0\uACB0 \uC124\uC815" },
-                            React.createElement(IconSettings, { size: 16 }))))),
-            React.createElement("main", { key: tab, className: "flex-1 min-w-0 p-4 md:p-8 overflow-y-auto fade-in-up" },
-                React.createElement("div", { className: "desktop-wrap" },
-                    tab === "dashboard" && React.createElement(Dashboard, { transactions: transactions, savings: savings, events: events, todos: todos, budgets: budgets, totalSavingsCurrent: totalSavingsCurrent }),
-                    tab === "savings" && React.createElement(SavingsInvestTab, { savings: savings, setSavings: setSavings, accounts: accounts }),
-                    tab === "insurance" && React.createElement(FixedCostsTab, { insurances: insurances, setInsurances: setInsurances, fixedExpenses: fixedExpenses, setFixedExpenses: setFixedExpenses, accounts: accounts }),
-                    tab === "expenses" && React.createElement(ExpensesTab, { transactions: transactions, addTransaction: addTransaction, addTransactions: addTransactions, deleteTransaction: deleteTransaction, updateTransaction: updateTransaction, cfg: cfg, onOpenSettings: () => setShowGemini(true), budgets: budgets, setBudgetForPeriod: setBudgetForPeriod }),
-                    tab === "calendar" && React.createElement(CalendarTab, { events: events, setEvents: setEvents }),
-                    tab === "todo" && React.createElement(TodoTab, { todos: todos, setTodos: setTodos }),
-                    tab === "accounts" && React.createElement(AccountsTab, { accounts: accounts, setAccounts: setAccounts, transfers: transfers, setTransfers: setTransfers, insurances: insurances, fixedExpenses: fixedExpenses, savings: savings })))),
-        React.createElement("nav", { className: "md:hidden fixed bottom-0 left-0 right-0 flex z-10", style: { background: C.surface, borderTop: `1px solid ${C.border}`, boxShadow: "0 -4px 16px rgba(24,26,32,0.06)", paddingBottom: "env(safe-area-inset-bottom, 0px)" } }, NAV.map((n) => {
-            const IconComp = n.icon;
-            const active = tab === n.id;
-            return (React.createElement("button", { key: n.id, onClick: () => setTab(n.id), className: "flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 py-2 transition-transform duration-150", style: { transform: active ? "translateY(-2px)" : "none" } },
-                React.createElement(IconComp, { size: 18, color: active ? C.ink : C.muted }),
-                React.createElement("span", { className: "text-[9.5px] leading-tight truncate w-full text-center px-0.5", style: { color: active ? C.ink : C.muted, fontWeight: active ? 600 : 400 } }, n.shortLabel)));
-        })),
-        showSettings && (React.createElement("div", { className: "fixed inset-0 flex items-center justify-center p-6 z-20", style: { background: "rgba(24,26,32,0.45)" } },
-            React.createElement(Card, { style: { maxWidth: 460, maxHeight: "88vh", overflowY: "auto" }, className: "w-full relative fade-in-up" },
-                React.createElement("div", { className: "flex justify-end" },
-                    React.createElement(IconBtn, { onClick: () => { setShowSettings(false); setIoMsg(null); setResetMode(null); setResetMsg(null); }, title: "\uB2EB\uAE30" },
-                        React.createElement(IconX, { size: 16 }))),
-                React.createElement("h3", { className: "text-base font-semibold mb-3", style: { fontFamily: SERIF } }, "\uC124\uC815"),
-                React.createElement("p", { className: "text-sm font-medium mb-1" }, "\uAC00\uACC4\uBD80 \uC774\uB984"),
-                React.createElement("p", { className: "text-xs mb-2", style: { color: C.muted } }, "\uC67C\uCABD \uC704\uC5D0 \uD45C\uC2DC\uB418\uB294 \uC774\uB984\uC785\uB2C8\uB2E4. \uBC30\uC6B0\uC790 \uD654\uBA74\uC5D0\uB3C4 \uB611\uAC19\uC774 \uC801\uC6A9\uB429\uB2C8\uB2E4."),
-                React.createElement("div", { className: "flex gap-2 mb-5" },
-                    React.createElement(TextInput, { value: titleDraft, onChange: (e) => setTitleDraft(e.target.value), placeholder: "\uC608: \uC6B0\uB9AC\uC9D1 \uAC00\uACC4\uBD80", maxLength: 24 }),
-                    React.createElement(PrimaryBtn, { onClick: () => { const v = titleDraft.trim(); if (v)
-                            setTitle(v); } }, "\uBCC0\uACBD")),
-                React.createElement("p", { className: "text-xs mb-2", style: { color: C.muted } }, "\uC774 \uAE30\uAE30\uAC00 \uC5F0\uACB0\uB41C \uC800\uC7A5\uC18C \uC8FC\uC18C"),
-                React.createElement("div", { className: "text-xs mb-3 p-2.5 rounded-lg", style: { background: "#FAF9F6", color: C.inkSoft, fontFamily: "monospace", wordBreak: "break-all", border: `1px solid ${C.border}` } }, cfg.apiUrl),
-                React.createElement("button", { onClick: async () => { const ok = await copyText(pairCode); setPairCopied(ok); setTimeout(() => setPairCopied(false), 2000); }, className: "w-full py-2.5 rounded-lg text-sm font-medium mb-1.5", style: { background: pairCopied ? C.positiveSoft : C.ink, color: pairCopied ? C.positive : "#fff" } }, pairCopied ? "✓ 연결코드를 복사했어요" : "배우자에게 연결코드 보내기"),
-                React.createElement("p", { className: "text-xs mb-3", style: { color: C.muted } }, "\uBCF5\uC0AC\uB41C \uCF54\uB4DC\uB97C \uBC30\uC6B0\uC790\uC5D0\uAC8C \uC804\uB2EC\uD558\uBA74, \uBC30\uC6B0\uC790 \uC571\uC758 \uCCAB \uD654\uBA74\uC5D0\uC11C \uBD99\uC5EC\uB123\uAE30\uB9CC\uC73C\uB85C \uAC19\uC740 \uAC00\uACC4\uBD80\uC5D0 \uC5F0\uACB0\uB429\uB2C8\uB2E4."),
-                React.createElement("div", { className: "rounded-xl p-3.5 mb-3", style: { background: "#FAF9F6", border: `1px solid ${C.border}` } },
-                    React.createElement("div", { className: "text-sm font-semibold mb-1", style: { color: C.ink } }, "\uD734\uB300\uD3F0\uC5D0\uC11C \uC4F0\uAE30"),
-                    mobileLink(pairCode) ? (React.createElement(React.Fragment, null,
+            showSettings && (React.createElement("div", { className: "fixed inset-0 flex items-center justify-center p-6 z-20", style: { background: "rgba(24,26,32,0.45)" } },
+                React.createElement(Card, { style: { maxWidth: 460, maxHeight: "88vh", overflowY: "auto" }, className: "w-full relative fade-in-up" },
+                    React.createElement("div", { className: "flex justify-end" },
+                        React.createElement(IconBtn, { onClick: () => { setShowSettings(false); setIoMsg(null); setResetMode(null); setResetMsg(null); }, title: "\uB2EB\uAE30" },
+                            React.createElement(IconX, { size: 16 }))),
+                    React.createElement("h3", { className: "text-base font-semibold mb-3", style: { fontFamily: SERIF } }, "\uC124\uC815"),
+                    React.createElement("p", { className: "text-sm font-medium mb-1" }, "\uAC00\uACC4\uBD80 \uC774\uB984"),
+                    React.createElement("p", { className: "text-xs mb-2", style: { color: C.muted } }, "\uC67C\uCABD \uC704\uC5D0 \uD45C\uC2DC\uB418\uB294 \uC774\uB984\uC785\uB2C8\uB2E4. \uBC30\uC6B0\uC790 \uD654\uBA74\uC5D0\uB3C4 \uB611\uAC19\uC774 \uC801\uC6A9\uB429\uB2C8\uB2E4."),
+                    React.createElement("div", { className: "flex gap-2 mb-5" },
+                        React.createElement(TextInput, { value: titleDraft, onChange: (e) => setTitleDraft(e.target.value), placeholder: "\uC608: \uC6B0\uB9AC\uC9D1 \uAC00\uACC4\uBD80", maxLength: 24 }),
+                        React.createElement(PrimaryBtn, { onClick: () => { const v = titleDraft.trim(); if (v)
+                                setTitle(v); } }, "\uBCC0\uACBD")),
+                    React.createElement("p", { className: "text-sm font-medium mb-1" }, "\uC9C0\uAC11 \uC774\uB984"),
+                    React.createElement("p", { className: "text-xs mb-2 leading-relaxed", style: { color: C.muted } }, "\uC0DD\uD65C\uBE44\uB97C \uB450 \uAC08\uB798\uB85C \uB098\uB220\uC11C \uAD00\uB9AC\uD569\uB2C8\uB2E4. \uC6B0\uB9AC \uC9D1\uC5D0\uC11C \uBD80\uB974\uB294 \uB9D0\uB85C \uBC14\uAFD4 \uC4F0\uC138\uC694. (\uC608: \uC0DD\uD65C\uBE44 / \uD488\uC704\uC720\uC9C0\uBE44, \uACF5\uB3D9 / \uAC1C\uC778, \uACE0\uC815\uBE44 / \uC5EC\uC720\uBE44)"),
+                    React.createElement("div", { className: "grid grid-cols-2 gap-2 mb-2" },
+                        React.createElement(TextInput, { value: pocketDraft.living, onChange: (e) => setPocketDraft({ ...pocketDraft, living: e.target.value }), placeholder: POCKET_DEFAULTS.living, maxLength: 12 }),
+                        React.createElement(TextInput, { value: pocketDraft.incidental, onChange: (e) => setPocketDraft({ ...pocketDraft, incidental: e.target.value }), placeholder: POCKET_DEFAULTS.incidental, maxLength: 12 })),
+                    React.createElement("div", { className: "flex gap-2 mb-5" },
+                        React.createElement("button", { onClick: () => setPocketDraft(POCKET_DEFAULTS), className: "px-3 py-2 rounded-lg text-sm", style: { background: "#EFEAE0", color: C.inkSoft } }, "\uAE30\uBCF8\uAC12"),
+                        React.createElement(PrimaryBtn, { onClick: () => {
+                                const l = (pocketDraft.living || "").trim(), i = (pocketDraft.incidental || "").trim();
+                                if (!l || !i)
+                                    return;
+                                setPockets({ living: l, incidental: i });
+                            } }, "\uC9C0\uAC11 \uC774\uB984 \uBCC0\uACBD")),
+                    React.createElement("p", { className: "text-xs mb-2", style: { color: C.muted } }, "\uC774 \uAE30\uAE30\uAC00 \uC5F0\uACB0\uB41C \uC800\uC7A5\uC18C \uC8FC\uC18C"),
+                    React.createElement("div", { className: "text-xs mb-3 p-2.5 rounded-lg", style: { background: "#FAF9F6", color: C.inkSoft, fontFamily: "monospace", wordBreak: "break-all", border: `1px solid ${C.border}` } }, cfg.apiUrl),
+                    React.createElement("button", { onClick: async () => { const ok = await copyText(pairCode); setPairCopied(ok); setTimeout(() => setPairCopied(false), 2000); }, className: "w-full py-2.5 rounded-lg text-sm font-medium mb-1.5", style: { background: pairCopied ? C.positiveSoft : C.ink, color: pairCopied ? C.positive : "#fff" } }, pairCopied ? "✓ 연결코드를 복사했어요" : "배우자에게 연결코드 보내기"),
+                    React.createElement("p", { className: "text-xs mb-3", style: { color: C.muted } }, "\uBCF5\uC0AC\uB41C \uCF54\uB4DC\uB97C \uBC30\uC6B0\uC790\uC5D0\uAC8C \uC804\uB2EC\uD558\uBA74, \uBC30\uC6B0\uC790 \uC571\uC758 \uCCAB \uD654\uBA74\uC5D0\uC11C \uBD99\uC5EC\uB123\uAE30\uB9CC\uC73C\uB85C \uAC19\uC740 \uAC00\uACC4\uBD80\uC5D0 \uC5F0\uACB0\uB429\uB2C8\uB2E4."),
+                    mobileLink(pairCode) && (React.createElement("div", { className: "rounded-xl p-3.5 mb-3", style: { background: "#FAF9F6", border: `1px solid ${C.border}` } },
+                        React.createElement("div", { className: "text-sm font-semibold mb-1", style: { color: C.ink } }, "\uD734\uB300\uD3F0\uC5D0\uC11C \uC4F0\uAE30"),
                         React.createElement("p", { className: "text-xs mb-3", style: { color: C.muted } },
                             "\uD734\uB300\uD3F0 \uCE74\uBA54\uB77C\uB85C \uC544\uB798 QR \uC744 \uCC0D\uC73C\uBA74 \uAC19\uC740 \uAC00\uACC4\uBD80\uAC00 \uBC14\uB85C \uC5F4\uB9BD\uB2C8\uB2E4. \uC124\uCE58 \uC5C6\uC774 \uC4F0\uACE0, \uBE0C\uB77C\uC6B0\uC800 \uBA54\uB274\uC758 ",
                             React.createElement("b", null, "\uD648 \uD654\uBA74\uC5D0 \uCD94\uAC00"),
                             " \uB97C \uB204\uB974\uBA74 \uC571\uCC98\uB7FC \uC544\uC774\uCF58\uC774 \uC0DD\uAE41\uB2C8\uB2E4."),
                         React.createElement(QrCode, { text: mobileLink(pairCode), size: 190, caption: "\uCE74\uBA54\uB77C \uC571\uC73C\uB85C \uCC0D\uC73C\uC138\uC694" }),
                         React.createElement("button", { onClick: async () => { const ok = await copyText(mobileLink(pairCode)); setMobileCopied(ok); setTimeout(() => setMobileCopied(false), 2000); }, className: "w-full py-2 rounded-lg text-sm font-medium mt-3", style: { background: mobileCopied ? C.positiveSoft : "#EFEAE0", color: mobileCopied ? C.positive : C.inkSoft } }, mobileCopied ? "✓ 주소를 복사했어요" : "휴대폰용 주소 복사 (카톡으로 보내기)"),
-                        React.createElement("p", { className: "text-xs mt-2", style: { color: C.negative } }, "\uC774 QR \uC5D0\uB294 \uB0B4 \uAC00\uACC4\uBD80 \uC5F4\uC1E0\uAC00 \uB4E4\uC5B4 \uC788\uC2B5\uB2C8\uB2E4. \uB2E4\uB978 \uC0AC\uB78C\uC5D0\uAC8C \uBCF4\uC5EC\uC8FC\uC9C0 \uB9C8\uC138\uC694."))) : (React.createElement("p", { className: "text-xs leading-relaxed", style: { color: C.muted } },
-                        "\uD734\uB300\uD3F0\uC6A9 \uC6F9 \uC8FC\uC18C\uAC00 \uC544\uC9C1 \uC124\uC815\uB418\uC9C0 \uC54A\uC558\uC2B5\uB2C8\uB2E4. (\uC81C\uC791\uC790\uC6A9: src/app.jsx \uC758 ",
-                        React.createElement("b", null, "MOBILE_WEB_URL"),
-                        " \uC5D0 \uC8FC\uC18C\uB97C \uB123\uACE0 \uB2E4\uC2DC \uBE4C\uB4DC\uD558\uC138\uC694.)"))),
-                !resetMode ? (React.createElement("button", { onClick: () => { setResetMode("menu"); setResetMsg(null); }, className: "w-full py-2 rounded-lg text-sm font-medium", style: { background: "#EFEAE0", color: C.inkSoft } }, "\uCD08\uAE30\uD654 \u00B7 \uB2E4\uB978 \uC800\uC7A5\uC18C\uB85C \uB2E4\uC2DC \uC5F0\uACB0")) : (React.createElement("div", { className: "rounded-xl p-3.5", style: { background: "#FAF9F6", border: `1px solid ${C.border}` } },
-                    React.createElement("div", { className: "flex items-center justify-between mb-2" },
-                        React.createElement("div", { className: "text-sm font-semibold", style: { color: C.ink } }, "\uCD08\uAE30\uD654"),
-                        React.createElement("button", { onClick: () => { setResetMode(null); setResetMsg(null); }, className: "text-xs", style: { color: C.muted } }, "\uCDE8\uC18C")),
-                    React.createElement("button", { onClick: () => { if (window.confirm("이 PC 의 연결 정보를 지우고 처음 설정 화면으로 돌아갑니다.\n구글 시트의 가계부 내용은 그대로 남습니다."))
-                            onChangeServer({ keepGeminiKey: false }); }, className: "w-full text-left px-3 py-2.5 rounded-lg mb-2", style: { background: C.surface, border: `1px solid ${C.border}` } },
-                        React.createElement("div", { className: "text-sm font-medium", style: { color: C.ink } }, "\uC774 PC \uB9CC \uCD08\uAE30\uD654"),
-                        React.createElement("div", { className: "text-xs mt-0.5", style: { color: C.muted } },
-                            "\uC5F0\uACB0 \uC8FC\uC18C\u00B7\uC5F4\uC1E0\u00B7\uC800\uC7A5\uB41C \uD654\uBA74 \uC815\uBCF4\uB97C \uC9C0\uC6B0\uACE0 \uCC98\uC74C \uC124\uC815\uBD80\uD130 \uB2E4\uC2DC \uD569\uB2C8\uB2E4. ",
-                            React.createElement("b", null, "\uAD6C\uAE00 \uC2DC\uD2B8 \uB0B4\uC6A9\uC740 \uB0A8\uC2B5\uB2C8\uB2E4."))),
-                    React.createElement("button", { onClick: async () => {
-                            if (!window.confirm("구글 시트에 저장된 가계부 내용을 모두 지웁니다.\n거래내역·계좌·예적금·일정이 전부 사라지며 되돌릴 수 없습니다.\n\n계속할까요?"))
-                                return;
-                            if (!window.confirm("정말 지웁니다. 배우자 화면에서도 사라집니다.\n필요하면 먼저 [백업 파일로 내보내기] 를 해두세요.\n\n마지막 확인입니다."))
-                                return;
-                            setResetBusy(true);
-                            setResetMsg(null);
-                            try {
-                                for (const k of DATA_KEYS)
-                                    await remoteDelete(cfg, k);
-                                setResetMsg({ ok: true, text: "시트 데이터를 지웠습니다. 잠시 후 처음 설정 화면으로 돌아갑니다." });
-                                setTimeout(() => onChangeServer({ keepGeminiKey: true }), 1200);
-                            }
-                            catch (e) {
-                                setResetMsg({ ok: false, text: "삭제 실패 — " + ((e && e.message) || "네트워크를 확인해주세요") });
-                            }
-                            finally {
-                                setResetBusy(false);
-                            }
-                        }, disabled: resetBusy, className: "w-full text-left px-3 py-2.5 rounded-lg", style: { background: C.negativeSoft, border: `1px solid ${C.negative}`, opacity: resetBusy ? 0.6 : 1 } },
-                        React.createElement("div", { className: "text-sm font-medium", style: { color: C.negative } }, resetBusy ? "지우는 중..." : "구글 시트 데이터까지 전부 삭제"),
-                        React.createElement("div", { className: "text-xs mt-0.5", style: { color: C.negative } }, "\uAC00\uACC4\uBD80 \uB0B4\uC6A9\uC774 \uBAA8\uB450 \uC0AC\uB77C\uC9D1\uB2C8\uB2E4. \uB418\uB3CC\uB9B4 \uC218 \uC5C6\uACE0 \uBC30\uC6B0\uC790 \uD654\uBA74\uC5D0\uC11C\uB3C4 \uC0AC\uB77C\uC9D1\uB2C8\uB2E4.")),
-                    resetMsg && React.createElement("div", { className: "text-xs mt-2", style: { color: resetMsg.ok ? C.positive : C.negative } }, resetMsg.text))),
-                React.createElement("div", { className: "mt-5 pt-4", style: { borderTop: `1px dashed ${C.border}` } },
-                    React.createElement("p", { className: "text-sm font-medium mb-1" }, "Gemini API \uD0A4 (\uC601\uC218\uC99D \uC790\uB3D9\uC778\uC2DD\uC6A9)"),
-                    React.createElement("p", { className: "text-xs mb-2 leading-relaxed", style: { color: C.muted } }, "\uC601\uC218\uC99D\u00B7\uCE74\uB4DC\uB0B4\uC5ED \uC774\uBBF8\uC9C0\uB294 \uC774 PC \uC5D0\uC11C \uAD6C\uAE00 Gemini \uB85C \uC9C1\uC811 \uC804\uC1A1\uB429\uB2C8\uB2E4. \uD0A4\uB294 \uC774 PC \uC5D0\uB9CC \uC800\uC7A5\uB418\uBA70 \uAC1C\uC778\uC6A9 \uBB34\uB8CC \uC0AC\uC6A9\uB7C9 \uC548\uC5D0\uC11C \uB300\uAC1C \uC694\uAE08\uC774 \uBC1C\uC0DD\uD558\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4. \uD0A4\uB97C \uB123\uC9C0 \uC54A\uC544\uB3C4 \uC9C1\uC811 \uC785\uB825\uC73C\uB85C \uAC00\uACC4\uBD80\uB97C \uC4F8 \uC218 \uC788\uC5B4\uC694."),
-                    React.createElement("div", { className: "flex gap-2" },
-                        React.createElement(TextInput, { type: "password", value: geminiKeyDraft, onChange: (e) => setGeminiKeyDraft(e.target.value), placeholder: "AIzaSy..." }),
-                        React.createElement(PrimaryBtn, { onClick: () => onSaveGeminiKey(geminiKeyDraft.trim()) }, "\uC800\uC7A5")),
-                    React.createElement("button", { onClick: () => { setShowSettings(false); setShowGemini(true); }, className: "w-full py-2 rounded-lg text-sm font-medium mt-2", style: { background: C.accentSoft, color: C.accentDeep } }, "\uD0A4 \uBC1B\uB294 \uBC95 \uC790\uC138\uD788 \uBCF4\uAE30 (\uADF8\uB9BC \uC124\uBA85)"),
-                    cfg.geminiKey && React.createElement("div", { className: "text-xs mt-2", style: { color: C.positive } }, "\u2713 \uD0A4\uAC00 \uC800\uC7A5\uB418\uC5B4 \uC788\uC5B4\uC694")),
-                React.createElement("div", { className: "mt-5 pt-4", style: { borderTop: `1px dashed ${C.border}` } },
-                    React.createElement("p", { className: "text-sm font-medium mb-1" }, "\uBC31\uC5C5 / \uBCF5\uC6D0"),
-                    React.createElement("p", { className: "text-xs mb-2 leading-relaxed", style: { color: C.muted } }, "\uC804\uCCB4 \uAC00\uACC4\uBD80\uB97C \uD30C\uC77C \uD558\uB098\uB85C \uC800\uC7A5\uD574 \uB458 \uC218 \uC788\uC5B4\uC694. \uC800\uC7A5\uC18C\uB97C \uC62E\uAE30\uAC70\uB098 \uC2E4\uC218\uB85C \uC9C0\uC6E0\uC744 \uB54C \uADF8\uB300\uB85C \uB418\uB3CC\uB9BD\uB2C8\uB2E4."),
-                    React.createElement("div", { className: "flex gap-2" },
-                        React.createElement("button", { onClick: doExport, className: "flex-1 py-2 rounded-lg text-sm font-medium", style: { background: "#EFEAE0", color: C.inkSoft } }, "\uBC31\uC5C5 \uD30C\uC77C\uB85C \uB0B4\uBCF4\uB0B4\uAE30"),
-                        React.createElement("button", { onClick: doImport, className: "flex-1 py-2 rounded-lg text-sm font-medium", style: { background: "#EFEAE0", color: C.inkSoft } }, "\uBC31\uC5C5 \uD30C\uC77C\uC5D0\uC11C \uBCF5\uC6D0")),
-                    ioMsg && React.createElement("div", { className: "text-xs mt-2", style: { color: ioMsg.ok ? C.positive : C.negative } }, ioMsg.text),
-                    React.createElement("p", { className: "text-xs mt-2", style: { color: C.muted } }, "\uBCF5\uC6D0\uD558\uBA74 \uD604\uC7AC \uAC00\uACC4\uBD80 \uB0B4\uC6A9\uC744 \uBC31\uC5C5 \uD30C\uC77C \uB0B4\uC6A9\uC73C\uB85C \uB36E\uC5B4\uC501\uB2C8\uB2E4.")),
-                React.createElement("div", { className: "mt-5 pt-4", style: { borderTop: `1px dashed ${C.border}` } },
-                    React.createElement("button", { onClick: () => { setShowSettings(false); setShowHelp(true); }, className: "w-full py-2 rounded-lg text-sm font-medium", style: { background: "#EFEAE0", color: C.inkSoft } }, "\uC0AC\uC6A9 \uC548\uB0B4 \uB2E4\uC2DC \uBCF4\uAE30"))))),
-        showHelp && React.createElement(HelpModal, { onClose: () => setShowHelp(false), onGoTab: (id) => setTab(id) }),
-        showGemini && React.createElement(GeminiGuideModal, { onClose: () => setShowGemini(false), currentKey: cfg.geminiKey, onSave: (k) => { onSaveGeminiKey(k); setGeminiKeyDraft(k); } })));
+                        React.createElement("p", { className: "text-xs mt-2", style: { color: C.negative } }, "\uC774 QR \uC5D0\uB294 \uB0B4 \uAC00\uACC4\uBD80 \uC5F4\uC1E0\uAC00 \uB4E4\uC5B4 \uC788\uC2B5\uB2C8\uB2E4. \uB2E4\uB978 \uC0AC\uB78C\uC5D0\uAC8C \uBCF4\uC5EC\uC8FC\uC9C0 \uB9C8\uC138\uC694."))),
+                    !resetMode ? (React.createElement("button", { onClick: () => { setResetMode("menu"); setResetMsg(null); }, className: "w-full py-2 rounded-lg text-sm font-medium", style: { background: "#EFEAE0", color: C.inkSoft } }, "\uCD08\uAE30\uD654 \u00B7 \uB2E4\uB978 \uC800\uC7A5\uC18C\uB85C \uB2E4\uC2DC \uC5F0\uACB0")) : (React.createElement("div", { className: "rounded-xl p-3.5", style: { background: "#FAF9F6", border: `1px solid ${C.border}` } },
+                        React.createElement("div", { className: "flex items-center justify-between mb-2" },
+                            React.createElement("div", { className: "text-sm font-semibold", style: { color: C.ink } }, "\uCD08\uAE30\uD654"),
+                            React.createElement("button", { onClick: () => { setResetMode(null); setResetMsg(null); }, className: "text-xs", style: { color: C.muted } }, "\uCDE8\uC18C")),
+                        React.createElement("button", { onClick: () => { if (window.confirm("이 PC 의 연결 정보와 AI 키를 지우고 처음 설정 화면으로 돌아갑니다.\n구글 시트의 가계부 내용은 그대로 남습니다."))
+                                onChangeServer({ keepGeminiKey: false }); }, className: "w-full text-left px-3 py-2.5 rounded-lg mb-2", style: { background: C.surface, border: `1px solid ${C.border}` } },
+                            React.createElement("div", { className: "text-sm font-medium", style: { color: C.ink } }, "\uC774 PC \uB9CC \uCD08\uAE30\uD654"),
+                            React.createElement("div", { className: "text-xs mt-0.5", style: { color: C.muted } },
+                                "\uC5F0\uACB0 \uC8FC\uC18C\u00B7AI \uD0A4\u00B7\uC774 PC \uC5D0 \uC800\uC7A5\uB41C \uC815\uBCF4\uB97C \uC9C0\uC6B0\uACE0 \uCC98\uC74C \uC124\uC815\uBD80\uD130 \uB2E4\uC2DC \uD569\uB2C8\uB2E4. ",
+                                React.createElement("b", null, "\uAD6C\uAE00 \uC2DC\uD2B8 \uB0B4\uC6A9\uC740 \uB0A8\uC2B5\uB2C8\uB2E4."))),
+                        React.createElement("button", { onClick: async () => {
+                                if (!window.confirm("구글 시트에 저장된 가계부 내용을 모두 지웁니다.\n거래내역·계좌·예적금·일정·AI 키가 전부 사라지며 되돌릴 수 없습니다.\n\n계속할까요?"))
+                                    return;
+                                if (!window.confirm("정말 지웁니다. 배우자 화면에서도 사라집니다.\n필요하면 먼저 [백업 파일로 내보내기] 를 해두세요.\n\n마지막 확인입니다."))
+                                    return;
+                                setResetBusy(true);
+                                setResetMsg({ ok: true, text: "지우는 중입니다. 최대 1분 정도 걸릴 수 있어요." });
+                                pendingSaves.current += 1; // 지우는 동안 자동 동기화를 멈춘다
+                                try {
+                                    const r = await remoteClearAll(cfg, (i, n) => setResetMsg({ ok: true, text: `지우는 중... (${i}/${n})` }));
+                                    setResetMsg({ ok: true, text: (r.mode === "slow" ? "예전 버전 저장소라 하나씩 지웠습니다. " : "") + "완료되었습니다. 잠시 후 처음 설정 화면으로 돌아갑니다." });
+                                    setTimeout(() => onChangeServer({ keepGeminiKey: false }), 1400);
+                                }
+                                catch (e) {
+                                    const msg = String((e && e.message) || "네트워크를 확인해주세요");
+                                    setResetMsg({ ok: false, text: "삭제 실패 — " + msg + (/시간이 초과|LOCK_TIMEOUT/.test(msg) ? " · 구글 시트에서 KV 시트 탭을 직접 삭제해도 같은 효과입니다." : "") });
+                                }
+                                finally {
+                                    pendingSaves.current = Math.max(0, pendingSaves.current - 1);
+                                    setResetBusy(false);
+                                }
+                            }, disabled: resetBusy, className: "w-full text-left px-3 py-2.5 rounded-lg", style: { background: C.negativeSoft, border: `1px solid ${C.negative}`, opacity: resetBusy ? 0.6 : 1 } },
+                            React.createElement("div", { className: "text-sm font-medium", style: { color: C.negative } }, resetBusy ? "지우는 중..." : "구글 시트 데이터까지 전부 삭제"),
+                            React.createElement("div", { className: "text-xs mt-0.5", style: { color: C.negative } }, "\uAC00\uACC4\uBD80 \uB0B4\uC6A9\u00B7AI \uD0A4\u00B7\uC5F0\uACB0 \uC815\uBCF4\uAC00 \uBAA8\uB450 \uC0AC\uB77C\uC9D1\uB2C8\uB2E4. \uB418\uB3CC\uB9B4 \uC218 \uC5C6\uACE0 \uBC30\uC6B0\uC790 \uD654\uBA74\uC5D0\uC11C\uB3C4 \uC0AC\uB77C\uC9D1\uB2C8\uB2E4.")),
+                        resetMsg && React.createElement("div", { className: "text-xs mt-2", style: { color: resetMsg.ok ? C.positive : C.negative } }, resetMsg.text))),
+                    React.createElement("div", { className: "mt-5 pt-4", style: { borderTop: `1px dashed ${C.border}` } },
+                        React.createElement("p", { className: "text-sm font-medium mb-1" }, "Gemini API \uD0A4 (\uC601\uC218\uC99D \uC790\uB3D9\uC778\uC2DD\uC6A9)"),
+                        React.createElement("p", { className: "text-xs mb-2 leading-relaxed", style: { color: C.muted } }, "\uC601\uC218\uC99D\u00B7\uCE74\uB4DC\uB0B4\uC5ED \uC774\uBBF8\uC9C0\uB294 \uC774 PC \uC5D0\uC11C \uAD6C\uAE00 Gemini \uB85C \uC9C1\uC811 \uC804\uC1A1\uB429\uB2C8\uB2E4. \uAC1C\uC778\uC6A9 \uBB34\uB8CC \uC0AC\uC6A9\uB7C9 \uC548\uC5D0\uC11C \uB300\uAC1C \uC694\uAE08\uC774 \uBC1C\uC0DD\uD558\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4. \uD0A4\uB97C \uB123\uC9C0 \uC54A\uC544\uB3C4 \uC9C1\uC811 \uC785\uB825\uC73C\uB85C \uAC00\uACC4\uBD80\uB97C \uC4F8 \uC218 \uC788\uC5B4\uC694."),
+                        React.createElement("div", { className: "flex gap-2" },
+                            React.createElement(TextInput, { type: "password", value: geminiKeyDraft, onChange: (e) => setGeminiKeyDraft(e.target.value), placeholder: "AIzaSy..." }),
+                            React.createElement(PrimaryBtn, { onClick: () => { const k = geminiKeyDraft.trim(); onSaveGeminiKey(k); setSharedGemini(k); } }, "\uC800\uC7A5")),
+                        React.createElement("p", { className: "text-xs mt-1.5", style: { color: C.positive } }, "\uC800\uC7A5\uD558\uBA74 \uBC30\uC6B0\uC790 \uAE30\uAE30\uC5D0\uB3C4 \uC790\uB3D9\uC73C\uB85C \uC801\uC6A9\uB429\uB2C8\uB2E4. \uBC30\uC6B0\uC790\uAC00 \uB530\uB85C \uBC1C\uAE09\uBC1B\uC744 \uD544\uC694\uAC00 \uC5C6\uC5B4\uC694."),
+                        sharedGemini && (React.createElement("button", { onClick: () => { setSharedGemini(""); }, className: "text-xs mt-1", style: { color: C.muted, textDecoration: "underline" } }, "\uACF5\uC720 \uD574\uC81C (\uB0B4 \uAE30\uAE30\uC5D0\uC11C\uB9CC \uC0AC\uC6A9)")),
+                        React.createElement("button", { onClick: () => { setShowSettings(false); setShowGemini(true); }, className: "w-full py-2 rounded-lg text-sm font-medium mt-2", style: { background: C.accentSoft, color: C.accentDeep } }, "\uD0A4 \uBC1B\uB294 \uBC95 \uC790\uC138\uD788 \uBCF4\uAE30 (\uADF8\uB9BC \uC124\uBA85)"),
+                        cfg.geminiKey && React.createElement("div", { className: "text-xs mt-2", style: { color: C.positive } }, "\u2713 \uD0A4\uAC00 \uC800\uC7A5\uB418\uC5B4 \uC788\uC5B4\uC694")),
+                    React.createElement("div", { className: "mt-5 pt-4", style: { borderTop: `1px dashed ${C.border}` } },
+                        React.createElement("p", { className: "text-sm font-medium mb-1" }, "\uBC31\uC5C5 / \uBCF5\uC6D0"),
+                        React.createElement("p", { className: "text-xs mb-2 leading-relaxed", style: { color: C.muted } }, "\uC804\uCCB4 \uAC00\uACC4\uBD80\uB97C \uD30C\uC77C \uD558\uB098\uB85C \uC800\uC7A5\uD574 \uB458 \uC218 \uC788\uC5B4\uC694. \uC800\uC7A5\uC18C\uB97C \uC62E\uAE30\uAC70\uB098 \uC2E4\uC218\uB85C \uC9C0\uC6E0\uC744 \uB54C \uADF8\uB300\uB85C \uB418\uB3CC\uB9BD\uB2C8\uB2E4."),
+                        React.createElement("div", { className: "flex gap-2" },
+                            React.createElement("button", { onClick: doExport, className: "flex-1 py-2 rounded-lg text-sm font-medium", style: { background: "#EFEAE0", color: C.inkSoft } }, "\uBC31\uC5C5 \uD30C\uC77C\uB85C \uB0B4\uBCF4\uB0B4\uAE30"),
+                            React.createElement("button", { onClick: doImport, className: "flex-1 py-2 rounded-lg text-sm font-medium", style: { background: "#EFEAE0", color: C.inkSoft } }, "\uBC31\uC5C5 \uD30C\uC77C\uC5D0\uC11C \uBCF5\uC6D0")),
+                        ioMsg && React.createElement("div", { className: "text-xs mt-2", style: { color: ioMsg.ok ? C.positive : C.negative } }, ioMsg.text),
+                        React.createElement("p", { className: "text-xs mt-2", style: { color: C.muted } }, "\uBCF5\uC6D0\uD558\uBA74 \uD604\uC7AC \uAC00\uACC4\uBD80 \uB0B4\uC6A9\uC744 \uBC31\uC5C5 \uD30C\uC77C \uB0B4\uC6A9\uC73C\uB85C \uB36E\uC5B4\uC501\uB2C8\uB2E4.")),
+                    React.createElement("div", { className: "mt-5 pt-4", style: { borderTop: `1px dashed ${C.border}` } },
+                        React.createElement("button", { onClick: () => { setShowSettings(false); setShowHelp(true); }, className: "w-full py-2 rounded-lg text-sm font-medium", style: { background: "#EFEAE0", color: C.inkSoft } }, "\uC0AC\uC6A9 \uC548\uB0B4 \uB2E4\uC2DC \uBCF4\uAE30"))))),
+            showHelp && React.createElement(HelpModal, { onClose: () => setShowHelp(false), onGoTab: (id) => setTab(id) }),
+            showGemini && React.createElement(GeminiGuideModal, { onClose: () => setShowGemini(false), currentKey: cfg.geminiKey, onSave: (k) => { onSaveGeminiKey(k); setGeminiKeyDraft(k); setSharedGemini(k); } }),
+            showUpdate && React.createElement(StorageUpdateModal, { cfg: cfg, onClose: () => setShowUpdate(false), onRecheck: () => { setStorageOld(false); reloadAll(true); } }))));
 }
 // ---------- 대시보드 ----------
 function Dashboard({ transactions, savings, events, todos, budgets, totalSavingsCurrent }) {
+    const pn = usePocketNames();
     const period = useMemo(() => getCurrentPeriod(), []);
     const prevPeriod = useMemo(() => shiftPeriod(period, -1), [period]);
     const periodTx = useMemo(() => txInPeriod(transactions, period), [transactions, period]);
@@ -2195,7 +2298,12 @@ function Dashboard({ transactions, savings, events, todos, budgets, totalSavings
                         React.createElement("div", { className: "opacity-60 text-xs" }, "\uC608\uC801\uAE08\u00B7\uD22C\uC790 \uD3C9\uAC00\uC561"),
                         React.createElement("div", { style: { fontFamily: SERIF } }, formatWon(totalSavingsCurrent))),
                     React.createElement("div", null,
-                        React.createElement("div", { className: "opacity-60 text-xs" }, "\uC720\uB3D9\uC790\uAE08 (\uC0DD\uD65C\uBE44+\uD488\uC704\uC720\uC9C0\uBE44)"),
+                        React.createElement("div", { className: "opacity-60 text-xs" },
+                            "\uC720\uB3D9\uC790\uAE08 (",
+                            pn.living,
+                            "+",
+                            pn.incidental,
+                            ")"),
                         React.createElement("div", { style: { fontFamily: SERIF } }, formatWon(liquidFunds)))))),
         React.createElement("div", { className: "flex items-center justify-between flex-wrap gap-2 px-1" },
             React.createElement("div", { className: "text-xs", style: { color: C.muted } },
@@ -2204,7 +2312,9 @@ function Dashboard({ transactions, savings, events, todos, budgets, totalSavings
             React.createElement("div", { className: "text-xs font-medium px-2.5 py-1 rounded-full", style: { background: daysToSettlement <= 0 ? C.negativeSoft : C.accentSoft, color: daysToSettlement <= 0 ? C.negative : C.accentDeep } }, settlementLabel)),
         React.createElement("div", { className: "grid grid-cols-2 gap-4 md:gap-5" },
             React.createElement(Card, { lift: true, style: { borderColor: livingBalance < 0 ? C.negative : C.border } },
-                React.createElement("div", { className: "text-xs md:text-sm", style: { color: C.muted } }, "\uC0DD\uD65C\uBE44 \uC794\uACE0"),
+                React.createElement("div", { className: "text-xs md:text-sm", style: { color: C.muted } },
+                    pn.living,
+                    " \uC794\uACE0"),
                 React.createElement("div", { className: "text-xl md:text-2xl font-semibold mt-1", style: { fontFamily: SERIF, color: livingBalance >= 0 ? C.positive : C.negative } },
                     React.createElement(AnimatedNumber, { value: livingBalance })),
                 budgetObj.total > 0 && React.createElement("div", { className: "mt-2.5" },
@@ -2214,7 +2324,9 @@ function Dashboard({ transactions, savings, events, todos, budgets, totalSavings
                         " / ",
                         formatWon(budgetObj.total)))),
             React.createElement(Card, { lift: true, style: { borderColor: incidentalBalance < 0 ? C.negative : C.border } },
-                React.createElement("div", { className: "text-xs md:text-sm", style: { color: C.muted } }, "\uD488\uC704\uC720\uC9C0\uBE44 \uC794\uACE0"),
+                React.createElement("div", { className: "text-xs md:text-sm", style: { color: C.muted } },
+                    pn.incidental,
+                    " \uC794\uACE0"),
                 React.createElement("div", { className: "text-xl md:text-2xl font-semibold mt-1", style: { fontFamily: SERIF, color: incidentalBalance >= 0 ? C.accent : C.negative } },
                     React.createElement(AnimatedNumber, { value: incidentalBalance })),
                 budgetObj.incidental > 0 && React.createElement("div", { className: "mt-2.5" },
@@ -2707,9 +2819,10 @@ function FixedCostsTab({ insurances, setInsurances, fixedExpenses, setFixedExpen
         subTab === "insurance" && React.createElement(InsuranceSection, { insurances: insurances, setInsurances: setInsurances, accounts: accounts }),
         subTab === "fixed" && React.createElement(FixedExpenseSection, { fixedExpenses: fixedExpenses, setFixedExpenses: setFixedExpenses, accounts: accounts })));
 }
-// ---------- 생활비 예산관리 모달 ----------
+// ---------- 예산관리 모달 ----------
 function BudgetManageModal({ period, budgetObj, onSaveBudget, periodIncomeTx, addTransaction, deleteTransaction, onClose }) {
     const [total, setTotal] = useState(String(budgetObj.total || ""));
+    const pn = usePocketNames();
     const [incidental, setIncidental] = useState(String(budgetObj.incidental || ""));
     const [incForm, setIncForm] = useState({ date: todayStr(), amount: "", category: INCOME_CATS[0], memo: "" });
     const addIncome = (e) => {
@@ -2726,15 +2839,19 @@ function BudgetManageModal({ period, budgetObj, onSaveBudget, periodIncomeTx, ad
                     React.createElement("div", { className: "text-xs tracking-widest", style: { color: C.accent } }, "BUDGET"),
                     React.createElement("h3", { className: "text-lg font-semibold", style: { fontFamily: SERIF } },
                         periodLabel(period),
-                        " \uC0DD\uD65C\uBE44 \uC608\uC0B0\uAD00\uB9AC")),
+                        " \uC608\uC0B0\uAD00\uB9AC")),
                 React.createElement(IconBtn, { onClick: onClose },
                     React.createElement(IconX, { size: 16 }))),
             React.createElement("div", { className: "mt-4 grid sm:grid-cols-2 gap-3" },
-                React.createElement(Field, { label: "\uC774\uBC88 \uACB0\uC0B0 \uC0DD\uD65C\uBE44 \uC608\uC0B0 (\uC804\uCCB4)" },
+                React.createElement(Field, { label: `이번 결산 ${pn.living} 예산` },
                     React.createElement(MoneyInput, { value: total, onChange: setTotal, placeholder: "0" })),
-                React.createElement(Field, { label: "\uADF8 \uC911 \uD488\uC704\uC720\uC9C0\uBE44 (\uC120\uD0DD)" },
+                React.createElement(Field, { label: `${pn.incidental} 예산 (선택)` },
                     React.createElement(MoneyInput, { value: incidental, onChange: setIncidental, placeholder: "0" }))),
-            React.createElement("p", { className: "text-xs mt-2", style: { color: C.muted } }, "\uD488\uC704\uC720\uC9C0\uBE44\uB294 \uC0DD\uD65C\uBE44\uC640 \uC644\uC804\uD788 \uBD84\uB9AC\uB41C \uBCC4\uB3C4 \uC9C0\uAC11\uC774\uC5D0\uC694. \uAC70\uB798 \uCD94\uAC00 \uD654\uBA74\uC758 \uC2AC\uB77C\uC774\uB4DC \uD1A0\uAE00\uB85C \uC9C0\uAC11\uC744 \uC120\uD0DD\uD558\uC138\uC694."),
+            React.createElement("p", { className: "text-xs mt-2", style: { color: C.muted } },
+                pn.incidental,
+                "\uB294 ",
+                pn.living,
+                "\uC640 \uC644\uC804\uD788 \uBD84\uB9AC\uB41C \uBCC4\uB3C4 \uC9C0\uAC11\uC774\uC5D0\uC694. \uAC70\uB798 \uCD94\uAC00 \uD654\uBA74\uC758 \uD1A0\uAE00\uB85C \uC5B4\uB290 \uC9C0\uAC11\uC5D0\uC11C \uB098\uAC00\uB294\uC9C0 \uACE0\uB974\uC138\uC694. \uC774\uB984\uC740 \uC124\uC815(\u2699)\uC5D0\uC11C \uBC14\uAFC0 \uC218 \uC788\uC2B5\uB2C8\uB2E4."),
             React.createElement("p", { className: "text-xs mt-1", style: { color: C.muted } }, "\uAE09\uC5EC\uB294 \uAC70\uB798 \uCD94\uAC00 \uD654\uBA74\uC5D0\uC11C \uAD6C\uBD84=\uC218\uC785/\uCE74\uD14C\uACE0\uB9AC=\uAE09\uC5EC\uB85C \uB4F1\uB85D\uD558\uBA74 \uB300\uC2DC\uBCF4\uB4DC\uC5D0 \uC790\uB3D9 \uC9D1\uACC4\uB3FC\uC694."),
             React.createElement("div", { className: "mt-5 pt-4", style: { borderTop: `1px dashed ${C.border}` } },
                 React.createElement("div", { className: "text-sm font-medium mb-2" }, "\uC774\uBC88 \uACB0\uC0B0 \uC218\uC785 \uAD00\uB9AC"),
@@ -2804,7 +2921,12 @@ function BatchReviewModal({ items, onConfirm, onClose }) {
                         "\uAC74 \uC778\uC2DD)")),
                 React.createElement(IconBtn, { onClick: onClose },
                     React.createElement(IconX, { size: 16 }))),
-            React.createElement("p", { className: "text-xs mb-3", style: { color: C.muted } }, "\uC77C\uAD04 \uC778\uC2DD\uB41C \uD56D\uBAA9\uC740 \uBAA8\uB450 \uC0DD\uD65C\uBE44 \uC9C0\uAC11\uC73C\uB85C \uB4E4\uC5B4\uAC00\uC694. \uD488\uC704\uC720\uC9C0\uBE44\uB85C \uC62E\uAE30\uB824\uBA74 \uCD94\uAC00 \uD6C4 \uAC70\uB798\uB0B4\uC5ED\uC5D0\uC11C \uC218\uC815\uD574\uC8FC\uC138\uC694."),
+            React.createElement("p", { className: "text-xs mb-3", style: { color: C.muted } },
+                "\uC77C\uAD04 \uC778\uC2DD\uB41C \uD56D\uBAA9\uC740 \uBAA8\uB450 ",
+                React.createElement("b", null, pn.living),
+                " \uC9C0\uAC11\uC73C\uB85C \uB4E4\uC5B4\uAC00\uC694. ",
+                React.createElement("b", null, pn.incidental),
+                "\uB85C \uC62E\uAE30\uB824\uBA74 \uCD94\uAC00 \uD6C4 \uAC70\uB798\uB0B4\uC5ED\uC5D0\uC11C \uC218\uC815\uD574\uC8FC\uC138\uC694."),
             React.createElement("div", { className: "flex gap-3 mb-3" },
                 React.createElement("button", { onClick: () => toggleAll(true), className: "text-xs", style: { color: C.accent } }, "\uC804\uCCB4 \uC120\uD0DD"),
                 React.createElement("button", { onClick: () => toggleAll(false), className: "text-xs", style: { color: C.muted } }, "\uC804\uCCB4 \uD574\uC81C")),
@@ -2827,6 +2949,7 @@ function BatchReviewModal({ items, onConfirm, onClose }) {
 }
 // ---------- 생활비관리 ----------
 function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTransaction, updateTransaction, cfg, onOpenSettings, budgets, setBudgetForPeriod }) {
+    const pn = usePocketNames();
     const [period, setPeriod] = useState(() => getCurrentPeriod());
     const [showBudgetModal, setShowBudgetModal] = useState(false);
     const empty = { date: todayStr(), type: "expense", pocket: "living", category: EXPENSE_CATS[0], amount: "", memo: "", owner: "" };
@@ -2837,6 +2960,8 @@ function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTran
     const [ocrSuccess, setOcrSuccess] = useState(false);
     const [batchBusy, setBatchBusy] = useState(false);
     const [batchError, setBatchError] = useState(null);
+    const [aiStage, setAiStage] = useState(null); // 지금 어느 단계인지
+    const [aiStartedAt, setAiStartedAt] = useState(0);
     const [batchItems, setBatchItems] = useState(null);
     const fileInputRef = useRef(null);
     const batchInputRef = useRef(null);
@@ -2848,16 +2973,21 @@ function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTran
         setOcrBusy(true);
         setOcrError(null);
         setOcrSuccess(false);
+        setAiStartedAt(Date.now());
+        setAiStage("사진을 준비하고 있어요");
         try {
             if (!cfg.geminiKey) {
                 setOcrError("설정(⚙)에서 Gemini API 키를 먼저 입력해주세요.");
                 setOcrBusy(false);
+                setAiStage(null);
                 if (fileInputRef.current)
                     fileInputRef.current.value = "";
                 return;
             }
             const { base64, mimeType } = await fileToResizedBase64(file);
-            const rawText = await callGeminiWithRetry(cfg.geminiKey, GEMINI_MODEL, buildReceiptPrompt(todayStr()), base64, mimeType);
+            setAiStage("AI 가 영수증을 읽는 중");
+            const rawText = await callGeminiWithRetry(cfg.geminiKey, GEMINI_MODEL, buildReceiptPrompt(todayStr()), base64, mimeType, (n) => setAiStage(n === 0 ? "AI 가 영수증을 읽는 중" : `혼잡해서 다시 시도하는 중 (${n + 1}/3)`));
+            setAiStage("결과를 정리하는 중");
             const ex = JSON.parse(extractJsonFromText(rawText, "{", "}"));
             const exType = ex.type === "income" ? "income" : "expense";
             const cats = exType === "income" ? INCOME_CATS : EXPENSE_CATS;
@@ -2872,6 +3002,7 @@ function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTran
         }
         finally {
             setOcrBusy(false);
+            setAiStage(null);
             if (fileInputRef.current)
                 fileInputRef.current.value = "";
         }
@@ -2882,16 +3013,21 @@ function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTran
             return;
         setBatchBusy(true);
         setBatchError(null);
+        setAiStartedAt(Date.now());
+        setAiStage("화면 사진을 준비하고 있어요");
         try {
             if (!cfg.geminiKey) {
                 setBatchError("설정(⚙)에서 Gemini API 키를 먼저 입력해주세요.");
                 setBatchBusy(false);
+                setAiStage(null);
                 if (batchInputRef.current)
                     batchInputRef.current.value = "";
                 return;
             }
             const { base64, mimeType } = await fileToResizedBase64(file, 1800, 0.85);
-            const rawText = await callGeminiWithRetry(cfg.geminiKey, GEMINI_MODEL, buildBatchPrompt(todayStr()), base64, mimeType);
+            setAiStage("AI 가 거래내역을 읽는 중");
+            const rawText = await callGeminiWithRetry(cfg.geminiKey, GEMINI_MODEL, buildBatchPrompt(todayStr()), base64, mimeType, (n) => setAiStage(n === 0 ? "AI 가 거래내역을 읽는 중" : `혼잡해서 다시 시도하는 중 (${n + 1}/3)`));
+            setAiStage("결과를 정리하는 중");
             let arr = JSON.parse(extractJsonFromText(rawText, "[", "]"));
             arr = Array.isArray(arr) ? arr : [arr];
             if (arr.length === 0)
@@ -2906,6 +3042,7 @@ function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTran
         }
         finally {
             setBatchBusy(false);
+            setAiStage(null);
             if (batchInputRef.current)
                 batchInputRef.current.value = "";
         }
@@ -2944,7 +3081,7 @@ function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTran
     const isSettlementDay = new Date().getDate() === 15;
     return (React.createElement("div", { className: "flex flex-col gap-5 md:gap-6" },
         isSettlementDay && (React.createElement("div", { className: "rounded-xl px-4 py-3 text-sm flex items-center justify-between flex-wrap gap-2", style: { background: C.accentSoft, color: C.accentDeep } },
-            React.createElement("span", null, "\uC624\uB298\uC740 \uACB0\uC0B0\uC77C\uC774\uC5D0\uC694 \u2014 \uC774\uBC88\uB2EC \uC0DD\uD65C\uBE44 \uC608\uC0B0\uACFC \uC218\uC785\uC744 \uD655\uC778\uD574\uBCF4\uC138\uC694."),
+            React.createElement("span", null, "\uC624\uB298\uC740 \uACB0\uC0B0\uC77C\uC774\uC5D0\uC694 \u2014 \uC774\uBC88\uB2EC \uC608\uC0B0\uACFC \uC218\uC785\uC744 \uD655\uC778\uD574\uBCF4\uC138\uC694."),
             React.createElement("button", { onClick: () => setShowBudgetModal(true), className: "text-xs font-medium underline shrink-0" }, "\uC124\uC815\uD558\uAE30"))),
         React.createElement(Card, { lift: true, style: { borderColor: remaining < 0 ? C.negative : C.border } },
             React.createElement("div", { className: "flex items-center justify-between mb-3 flex-wrap gap-2" },
@@ -2958,10 +3095,12 @@ function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTran
                         React.createElement(IconChevronRight, { size: 16 }))),
                 React.createElement("button", { onClick: () => setShowBudgetModal(true), className: "inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium", style: { background: C.accentSoft, color: C.accentDeep } },
                     React.createElement(IconSettings, { size: 13 }),
-                    " \uC774\uBC88\uB2EC \uC0DD\uD65C\uBE44 \uC608\uC0B0\uAD00\uB9AC")),
+                    " \uC774\uBC88\uB2EC \uC608\uC0B0\uAD00\uB9AC")),
             React.createElement("div", { className: "grid sm:grid-cols-2 gap-5" },
                 React.createElement("div", null,
-                    React.createElement("div", { className: "text-xs md:text-sm", style: { color: C.muted } }, "\uC0DD\uD65C\uBE44 \uC794\uACE0"),
+                    React.createElement("div", { className: "text-xs md:text-sm", style: { color: C.muted } },
+                        pn.living,
+                        " \uC794\uACE0"),
                     React.createElement("div", { className: "text-2xl md:text-3xl font-semibold mt-1", style: { fontFamily: SERIF, color: remaining >= 0 ? C.positive : C.negative } }, formatWon(remaining)),
                     budgetObj.total > 0 && (React.createElement("div", { className: "mt-2" },
                         React.createElement(BudgetBar, { spent: livingExpense, budget: budgetObj.total }),
@@ -2972,7 +3111,9 @@ function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTran
                             " \uC0AC\uC6A9"))),
                     budgetObj.total === 0 && React.createElement("div", { className: "text-xs mt-2", style: { color: C.muted } }, "\uC608\uC0B0\uC774 \uC124\uC815\uB418\uC9C0 \uC54A\uC558\uC5B4\uC694.")),
                 React.createElement("div", null,
-                    React.createElement("div", { className: "text-xs md:text-sm", style: { color: C.muted } }, "\uD488\uC704\uC720\uC9C0\uBE44 \uC794\uACE0"),
+                    React.createElement("div", { className: "text-xs md:text-sm", style: { color: C.muted } },
+                        pn.incidental,
+                        " \uC794\uACE0"),
                     React.createElement("div", { className: "text-2xl md:text-3xl font-semibold mt-1", style: { fontFamily: SERIF, color: incidentalRemaining >= 0 ? C.accent : C.negative } }, formatWon(incidentalRemaining)),
                     budgetObj.incidental > 0 && (React.createElement("div", { className: "mt-2" },
                         React.createElement(BudgetBar, { spent: incidentalExpense, budget: budgetObj.incidental }),
@@ -3009,12 +3150,13 @@ function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTran
                     " \uCE74\uB4DC \uB0B4\uC5ED \uC77C\uAD04 \uC785\uB825",
                     React.createElement("input", { ref: batchInputRef, type: "file", accept: "image/*", onChange: handleBatchUpload, style: { display: "none" }, disabled: batchBusy })),
                 !cfg.geminiKey && (React.createElement("button", { onClick: onOpenSettings, className: "text-xs underline", style: { color: C.accent } }, "Gemini API \uD0A4 \uC124\uC815\uD558\uAE30")),
-                (ocrBusy || batchBusy) && React.createElement("span", { className: "text-xs flex items-center gap-1.5", style: { color: C.muted } },
-                    React.createElement(IconRefresh, { size: 12, style: { animation: "spin 0.8s linear infinite" } }),
-                    " AI \uBD84\uC11D \uC911... (\uD63C\uC7A1 \uC2DC \uC790\uB3D9 \uC7AC\uC2DC\uB3C4)"),
                 ocrError && React.createElement("span", { className: "text-xs", style: { color: C.negative } }, ocrError),
                 batchError && React.createElement("div", { className: "text-xs w-full mt-2 p-3 rounded-lg", style: { color: C.negative, background: C.negativeSoft, wordBreak: "break-word", whiteSpace: "pre-wrap", fontFamily: "monospace", fontSize: 11 } }, batchError),
-                ocrSuccess && !ocrBusy && React.createElement("span", { className: "text-xs", style: { color: C.positive } }, "\uC790\uB3D9 \uC785\uB825 \uC644\uB8CC \u2014 \uD655\uC778 \uD6C4 \uCD94\uAC00\uB97C \uB20C\uB7EC\uC8FC\uC138\uC694")),
+                ocrSuccess && !ocrBusy && React.createElement("span", { className: "text-xs", style: { color: C.positive } }, "\uC790\uB3D9 \uC785\uB825 \uC644\uB8CC \u2014 \uD655\uC778 \uD6C4 \uCD94\uAC00\uB97C \uB20C\uB7EC\uC8FC\uC138\uC694"),
+                (ocrBusy || batchBusy) && (React.createElement("div", { className: "w-full" },
+                    React.createElement(AiProgress, { stage: aiStage || "AI 가 읽는 중", startedAt: aiStartedAt, expectedMs: batchBusy ? 18000 : 9000, note: batchBusy
+                            ? "거래가 많으면 20초 이상 걸리기도 합니다. 창을 닫지 말고 기다려주세요."
+                            : "보통 5~15초 걸립니다. 창을 닫지 말고 기다려주세요." })))),
             React.createElement("div", { className: "mb-3", style: { maxWidth: 320 } },
                 React.createElement(PocketToggle, { value: form.pocket, onChange: (v) => setForm({ ...form, pocket: v }) })),
             React.createElement("form", { onSubmit: submit, className: "grid sm:grid-cols-2 lg:grid-cols-6 gap-3" },
