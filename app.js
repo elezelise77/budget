@@ -172,15 +172,26 @@ function txPocket(t) {
         return t.pocket;
     return t.category === "품위유지비" ? "incidental" : "living";
 }
-function computeLiquidFunds(transactions, budgets, period) {
+// 두 지갑의 잔고를 한 곳에서 계산한다.
+// 잔고 = 예산 - 쓴 돈 + 중간에 채워 넣은 돈(추가 입금)
+// 급여는 "지갑에 채운 돈"이 아니라 예산의 출처이므로 더하지 않는다. 더하면 이중 계산이 된다.
+//   (예: 예산 130만 / 쓴 돈 168만 / 추가 입금 50만 → 잔고 12만, 예산 막대는 그대로 초과 표시)
+function isPocketTopUp(t) { return t.type === "income" && t.category !== "급여"; }
+function computePocketBalances(transactions, budgets, period) {
     const periodTx = txInPeriod(transactions, period);
     const budgetObj = getBudgetObj(budgets, period);
-    const livingExpenseOnly = periodTx.filter((t) => t.type === "expense" && txPocket(t) !== "incidental").reduce((s, t) => s + Number(t.amount), 0);
-    const incidentalExpense = periodTx.filter((t) => t.type === "expense" && txPocket(t) === "incidental").reduce((s, t) => s + Number(t.amount), 0);
-    const incidentalIncome = periodTx.filter((t) => t.type === "income" && txPocket(t) === "incidental").reduce((s, t) => s + Number(t.amount), 0);
-    const livingBalance = budgetObj.total - livingExpenseOnly;
-    const incidentalBalance = budgetObj.incidental - incidentalExpense + incidentalIncome;
-    return livingBalance + incidentalBalance;
+    const sum = (f) => periodTx.filter(f).reduce((s, t) => s + Number(t.amount || 0), 0);
+    const livingExpense = sum((t) => t.type === "expense" && txPocket(t) !== "incidental");
+    const incidentalExpense = sum((t) => t.type === "expense" && txPocket(t) === "incidental");
+    const livingTopUp = sum((t) => isPocketTopUp(t) && txPocket(t) !== "incidental");
+    const incidentalTopUp = sum((t) => isPocketTopUp(t) && txPocket(t) === "incidental");
+    const livingBalance = budgetObj.total - livingExpense + livingTopUp;
+    const incidentalBalance = budgetObj.incidental - incidentalExpense + incidentalTopUp;
+    return { budgetObj, livingExpense, incidentalExpense, livingTopUp, incidentalTopUp,
+        livingBalance, incidentalBalance, liquidFunds: livingBalance + incidentalBalance };
+}
+function computeLiquidFunds(transactions, budgets, period) {
+    return computePocketBalances(transactions, budgets, period).liquidFunds;
 }
 // ---------- 일정 반복 로직 ----------
 function eventOccursOn(ev, d) {
@@ -562,6 +573,38 @@ async function remoteLoadAllAtOnce(cfg) {
     }
     return out;
 }
+// ---------- 다른(옛) 가계부 주소에서 통째로 가져오기 ----------
+// 예전 Apps Script 웹앱에는 비밀 열쇠도, 한 번에 읽기(action=all)도 없다.
+// 그래서 항목을 하나씩 읽어 온다. 항목 수가 적어서(9개) 몇 초면 끝난다.
+const IMPORT_KEYS = ["hh-accounts", "hh-transactions", "hh-savings", "hh-insurance",
+    "hh-fixed-expenses", "hh-events", "hh-todos", "hh-budget", "hh-transfers"];
+function isExecUrl(u) { return /^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(u); }
+async function fetchFromOtherApp(rawUrl, onProgress) {
+    const url = String(rawUrl || "").trim();
+    if (!isExecUrl(url))
+        throw new Error("주소는 https://script.google.com 으로 시작하고 /exec 로 끝나야 해요.");
+    const out = {};
+    let found = 0;
+    for (let i = 0; i < IMPORT_KEYS.length; i++) {
+        const k = IMPORT_KEYS[i];
+        if (onProgress)
+            onProgress(i + 1, IMPORT_KEYS.length);
+        const data = await httpJson(`${url}?key=${encodeURIComponent(k)}`, {}, 25000);
+        if (data.error)
+            throw new Error(data.error);
+        const raw = data.value;
+        if (raw === null || raw === undefined || raw === "")
+            continue;
+        try {
+            out[k] = JSON.parse(raw);
+            found += 1;
+        }
+        catch (e) { /* 깨진 값은 건너뛴다 */ }
+    }
+    if (found === 0)
+        throw new Error("그 주소에서 가계부 내용을 찾지 못했어요. 주소가 맞는지 확인해주세요.");
+    return out;
+}
 // 이 PC 에 저장된 앱 정보를 모두 지운다 (연결 주소·열쇠·캐시·안내 표시 여부).
 function wipeLocal(keepGeminiKey) {
     try {
@@ -685,8 +728,8 @@ function DateInput({ value, onChange, style }) {
 function IconBtn({ onClick, title, children, danger, style }) {
     return (React.createElement("button", { onClick: onClick, title: title, className: "p-2 rounded-lg transition-all duration-150 active:scale-90", style: { color: danger ? C.negative : C.inkSoft, ...style }, onMouseEnter: (e) => (e.currentTarget.style.background = danger ? C.negativeSoft : "#EFEAE0"), onMouseLeave: (e) => (e.currentTarget.style.background = "transparent") }, children));
 }
-function PrimaryBtn({ onClick, children, type = "button" }) {
-    return (React.createElement("button", { type: type, onClick: onClick, className: "inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm font-medium transition-all duration-150 hover:opacity-90 hover:-translate-y-px active:scale-95", style: { background: C.ink, color: "#fff", boxShadow: "0 2px 8px -2px rgba(24,26,32,0.35)" } }, children));
+function PrimaryBtn({ onClick, children, type = "button", disabled }) {
+    return (React.createElement("button", { type: type, onClick: onClick, disabled: !!disabled, className: "inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg text-sm font-medium whitespace-nowrap shrink-0 transition-all duration-150 hover:opacity-90 hover:-translate-y-px active:scale-95", style: { background: C.ink, color: "#fff", boxShadow: "0 2px 8px -2px rgba(24,26,32,0.35)", opacity: disabled ? 0.45 : 1 } }, children));
 }
 function SectionTitle({ children, action }) { return React.createElement("div", { className: "flex items-center justify-between mb-3 flex-wrap gap-2" },
     React.createElement("h3", { className: "text-base md:text-lg font-semibold", style: { color: C.ink } }, children),
@@ -1814,6 +1857,8 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
     const [titleDraft, setTitleDraft] = useState("");
     const [pocketDraft, setPocketDraft] = useState(POCKET_DEFAULTS);
     const [settleDraft, setSettleDraft] = useState(SETTLE_DAY_DEFAULT);
+    const [importUrl, setImportUrl] = useState(""); // 옛 가계부 주소
+    const [importing, setImporting] = useState(null); // {i, total} 진행 상황
     const [resetMode, setResetMode] = useState(null);
     const [resetBusy, setResetBusy] = useState(false);
     const [resetMsg, setResetMsg] = useState(null);
@@ -1878,6 +1923,38 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
         }
         catch (e) {
             setIoMsg({ ok: false, text: "복원 실패: " + (e.message || e) });
+        }
+    };
+    const doImportFromOther = async () => {
+        setIoMsg(null);
+        if (!isExecUrl(String(importUrl).trim())) {
+            setIoMsg({ ok: false, text: "주소는 https://script.google.com 으로 시작하고 /exec 로 끝나야 해요." });
+            return;
+        }
+        if (!window.confirm("옛 가계부의 내용을 지금 가계부로 가져옵니다.\n지금 들어 있는 내용은 덮어써집니다. 계속할까요?"))
+            return;
+        setImporting({ i: 0, total: IMPORT_KEYS.length });
+        try {
+            const d = await fetchFromOtherApp(importUrl, (i, total) => setImporting({ i, total }));
+            const pick = (k, fb) => (d[k] === undefined || d[k] === null ? fb : d[k]);
+            const nextTx = pick("hh-transactions", []), nextAcc = pick("hh-accounts", []);
+            setAccounts(nextAcc);
+            setTransactions(nextTx);
+            setSavings(pick("hh-savings", []));
+            setInsurances(pick("hh-insurance", []));
+            setFixedExpenses(pick("hh-fixed-expenses", []));
+            setEvents(pick("hh-events", []));
+            setTodos(pick("hh-todos", []));
+            setBudgets(pick("hh-budget", {}));
+            setTransfers(pick("hh-transfers", []));
+            setIoMsg({ ok: true, text: `가져왔어요 — 거래 ${nextTx.length}건, 계좌 ${nextAcc.length}개. 구글 시트에도 반영 중입니다.` });
+            setImportUrl("");
+        }
+        catch (e) {
+            setIoMsg({ ok: false, text: "가져오기 실패: " + ((e && e.message) || e) });
+        }
+        finally {
+            setImporting(null);
         }
     };
     const pendingSaves = useRef(0);
@@ -2302,6 +2379,24 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
                                 React.createElement("button", { onClick: doImport, className: "flex-1 py-2 rounded-lg text-sm font-medium", style: { background: "#EFEAE0", color: C.inkSoft } }, "\uBC31\uC5C5 \uD30C\uC77C\uC5D0\uC11C \uBCF5\uC6D0")),
                             ioMsg && React.createElement("div", { className: "text-xs mt-2", style: { color: ioMsg.ok ? C.positive : C.negative } }, ioMsg.text),
                             React.createElement("p", { className: "text-xs mt-2", style: { color: C.muted } }, "\uBCF5\uC6D0\uD558\uBA74 \uD604\uC7AC \uAC00\uACC4\uBD80 \uB0B4\uC6A9\uC744 \uBC31\uC5C5 \uD30C\uC77C \uB0B4\uC6A9\uC73C\uB85C \uB36E\uC5B4\uC501\uB2C8\uB2E4.")),
+                        IS_DESKTOP && (React.createElement("div", { className: "mt-5 pt-4", style: { borderTop: `1px dashed ${C.border}` } },
+                            React.createElement("p", { className: "text-sm font-medium mb-1" }, "\uB2E4\uB978 \uAC00\uACC4\uBD80\uC5D0\uC11C \uC62E\uACA8\uC624\uAE30"),
+                            React.createElement("p", { className: "text-xs mb-2 leading-relaxed", style: { color: C.muted } },
+                                "\uC608\uC804\uC5D0 \uC4F0\uB358 \uAC00\uACC4\uBD80(\uC6F9 \uC8FC\uC18C\uB85C \uC5F4\uB358 \uAC83)\uAC00 \uC788\uB2E4\uBA74, \uADF8 \uC8FC\uC18C\uB9CC \uB123\uC73C\uBA74 \uACC4\uC88C\u00B7\uAC70\uB798\u00B7\uC608\uC801\uAE08\u00B7\uC77C\uC815\uAE4C\uC9C0 \uD55C \uBC88\uC5D0 \uC62E\uACA8\uC635\uB2C8\uB2E4. \uC62E\uACA8\uC628 \uB4A4\uC5D0\uB3C4 ",
+                                React.createElement("b", null, "\uC61B \uAC00\uACC4\uBD80\uB294 \uADF8\uB300\uB85C \uB0A8\uC544"),
+                                " \uC788\uC5B4\uC694."),
+                            React.createElement("div", { className: "flex gap-2 mb-1.5" },
+                                React.createElement(TextInput, { value: importUrl, onChange: (e) => { setImportUrl(e.target.value); setIoMsg(null); }, placeholder: "https://script.google.com/macros/s/xxxxx/exec" }),
+                                React.createElement(PrimaryBtn, { disabled: !!importing || !importUrl.trim(), onClick: doImportFromOther }, importing ? "가져오는 중..." : "가져오기")),
+                            importing && (React.createElement("div", { className: "mb-1.5" },
+                                React.createElement("div", { className: "h-2 rounded-full overflow-hidden", style: { background: C.bgAlt } },
+                                    React.createElement("div", { className: "h-2 rounded-full", style: { width: `${Math.round((importing.i / importing.total) * 100)}%`, background: C.accent, transition: "width 0.3s ease" } })),
+                                React.createElement("p", { className: "text-xs mt-1", style: { color: C.inkSoft } },
+                                    importing.total,
+                                    "\uAC1C \uC911 ",
+                                    importing.i,
+                                    "\uAC1C \uBD88\uB7EC\uC624\uB294 \uC911..."))),
+                            React.createElement("p", { className: "text-xs", style: { color: C.muted } }, "\uC9C0\uAE08 \uAC00\uACC4\uBD80\uC5D0 \uB4E4\uC5B4 \uC788\uB294 \uB0B4\uC6A9\uC740 \uB36E\uC5B4\uC368\uC9D1\uB2C8\uB2E4. \uAC71\uC815\uB418\uBA74 \uC704\uC5D0\uC11C \uBC31\uC5C5\uC744 \uBA3C\uC800 \uBC1B\uC544\uB450\uC138\uC694."))),
                         React.createElement("div", { className: "mt-5 pt-4", style: { borderTop: `1px dashed ${C.border}` } },
                             React.createElement("button", { onClick: () => { setShowSettings(false); setShowHelp(true); }, className: "w-full py-2 rounded-lg text-sm font-medium", style: { background: "#EFEAE0", color: C.inkSoft } }, "\uC0AC\uC6A9 \uC548\uB0B4 \uB2E4\uC2DC \uBCF4\uAE30"))))),
                 showHelp && React.createElement(HelpModal, { onClose: () => setShowHelp(false), onGoTab: (id) => setTab(id) }),
@@ -2318,13 +2413,8 @@ function Dashboard({ transactions, savings, events, todos, budgets, totalSavings
     const prevTx = useMemo(() => txInPeriod(transactions, prevPeriod), [transactions, prevPeriod]);
     const prevIncome = prevTx.filter((t) => t.type === "income").reduce((s, t) => s + Number(t.amount), 0);
     const prevExpense = prevTx.filter((t) => t.type === "expense").reduce((s, t) => s + Number(t.amount), 0);
-    const livingExpenseOnly = periodTx.filter((t) => t.type === "expense" && txPocket(t) !== "incidental").reduce((s, t) => s + Number(t.amount), 0);
-    const incidentalExpense = periodTx.filter((t) => t.type === "expense" && txPocket(t) === "incidental").reduce((s, t) => s + Number(t.amount), 0);
-    const incidentalIncome = periodTx.filter((t) => t.type === "income" && txPocket(t) === "incidental").reduce((s, t) => s + Number(t.amount), 0);
-    const budgetObj = getBudgetObj(budgets, period);
-    const livingBalance = budgetObj.total - livingExpenseOnly;
-    const incidentalBalance = budgetObj.incidental - incidentalExpense + incidentalIncome;
-    const liquidFunds = livingBalance + incidentalBalance;
+    const pb = useMemo(() => computePocketBalances(transactions, budgets, period), [transactions, budgets, period]);
+    const { budgetObj, livingExpense: livingExpenseOnly, incidentalExpense, livingTopUp, incidentalTopUp, livingBalance, incidentalBalance, liquidFunds } = pb;
     const totalAssets = totalSavingsCurrent + liquidFunds;
     const now = new Date();
     const thisMonthNum = now.getMonth() + 1;
@@ -2382,7 +2472,8 @@ function Dashboard({ transactions, savings, events, todos, budgets, totalSavings
                     React.createElement("div", { className: "text-[11px] mt-1", style: { color: C.muted } },
                         formatWon(livingExpenseOnly),
                         " / ",
-                        formatWon(budgetObj.total)))),
+                        formatWon(budgetObj.total),
+                        livingTopUp > 0 ? ` (+${formatWon(livingTopUp)} 입금)` : ""))),
             React.createElement(Card, { lift: true, style: { borderColor: incidentalBalance < 0 ? C.negative : C.border } },
                 React.createElement("div", { className: "text-xs md:text-sm", style: { color: C.muted } },
                     pn.incidental,
@@ -2394,7 +2485,8 @@ function Dashboard({ transactions, savings, events, todos, budgets, totalSavings
                     React.createElement("div", { className: "text-[11px] mt-1", style: { color: C.muted } },
                         formatWon(incidentalExpense),
                         " / ",
-                        formatWon(budgetObj.incidental)))),
+                        formatWon(budgetObj.incidental),
+                        incidentalTopUp > 0 ? ` (+${formatWon(incidentalTopUp)} 입금)` : ""))),
             React.createElement(Card, { lift: true },
                 React.createElement("div", { className: "text-xs md:text-sm", style: { color: C.muted } },
                     "\uC774\uBC88\uB2EC \uAE09\uC5EC(",
@@ -2913,6 +3005,12 @@ function BudgetManageModal({ period, budgetObj, onSaveBudget, periodIncomeTx, ad
                 pn.living,
                 "\uC640 \uC644\uC804\uD788 \uBD84\uB9AC\uB41C \uBCC4\uB3C4 \uC9C0\uAC11\uC774\uC5D0\uC694. \uAC70\uB798 \uCD94\uAC00 \uD654\uBA74\uC758 \uD1A0\uAE00\uB85C \uC5B4\uB290 \uC9C0\uAC11\uC5D0\uC11C \uB098\uAC00\uB294\uC9C0 \uACE0\uB974\uC138\uC694. \uC774\uB984\uC740 \uC124\uC815(\u2699)\uC5D0\uC11C \uBC14\uAFC0 \uC218 \uC788\uC2B5\uB2C8\uB2E4."),
             React.createElement("p", { className: "text-xs mt-1", style: { color: C.muted } }, "\uAE09\uC5EC\uB294 \uAC70\uB798 \uCD94\uAC00 \uD654\uBA74\uC5D0\uC11C \uAD6C\uBD84=\uC218\uC785/\uCE74\uD14C\uACE0\uB9AC=\uAE09\uC5EC\uB85C \uB4F1\uB85D\uD558\uBA74 \uB300\uC2DC\uBCF4\uB4DC\uC5D0 \uC790\uB3D9 \uC9D1\uACC4\uB3FC\uC694."),
+            React.createElement("p", { className: "text-xs mt-1 leading-relaxed", style: { color: C.muted } },
+                "\uC608\uC0B0\uC774 \uBAA8\uC790\uB77C ",
+                React.createElement("b", null, "\uC911\uAC04\uC5D0 \uB3C8\uC744 \uB354 \uB123\uC5C8\uB2E4\uBA74"),
+                " \uC544\uB798\uC5D0\uC11C ",
+                React.createElement("b", null, "\uAE09\uC5EC \uC678 \uCE74\uD14C\uACE0\uB9AC"),
+                "(\uBD80\uC218\uC785 \u00B7 \uD658\uAE09/\uAE30\uD0C0 \uB4F1)\uB85C \uB4F1\uB85D\uD558\uC138\uC694. \uADF8\uB9CC\uD07C \uC794\uACE0\uC5D0 \uB354\uD574\uC9C0\uACE0, \uC608\uC0B0 \uB9C9\uB300\uB294 \uCD08\uACFC\uB41C \uADF8\uB300\uB85C \uBCF4\uC5EC\uC90D\uB2C8\uB2E4. \uAE09\uC5EC\uB294 \uC608\uC0B0\uC758 \uCD9C\uCC98\uB77C\uC11C \uC794\uACE0\uC5D0 \uB2E4\uC2DC \uB354\uD558\uC9C0 \uC54A\uC544\uC694."),
             React.createElement("div", { className: "mt-5 pt-4", style: { borderTop: `1px dashed ${C.border}` } },
                 React.createElement("div", { className: "text-sm font-medium mb-2" }, "\uC774\uBC88 \uACB0\uC0B0 \uC218\uC785 \uAD00\uB9AC"),
                 React.createElement("form", { onSubmit: addIncome, className: "grid grid-cols-2 gap-2 mb-3" },
@@ -3134,12 +3232,10 @@ function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTran
     const periodSalaryTx = useMemo(() => periodTx.filter((t) => t.type === "income" && t.category === "급여"), [periodTx]);
     const income = periodIncomeTx.reduce((s, t) => s + Number(t.amount), 0);
     const expense = periodTx.filter((t) => t.type === "expense").reduce((s, t) => s + Number(t.amount), 0);
-    const livingExpense = periodTx.filter((t) => t.type === "expense" && txPocket(t) !== "incidental").reduce((s, t) => s + Number(t.amount), 0);
-    const incidentalExpense = periodTx.filter((t) => t.type === "expense" && txPocket(t) === "incidental").reduce((s, t) => s + Number(t.amount), 0);
-    const incidentalIncome = periodTx.filter((t) => t.type === "income" && txPocket(t) === "incidental").reduce((s, t) => s + Number(t.amount), 0);
-    const budgetObj = getBudgetObj(budgets, period);
-    const remaining = budgetObj.total - livingExpense;
-    const incidentalRemaining = budgetObj.incidental - incidentalExpense + incidentalIncome;
+    const pb = useMemo(() => computePocketBalances(transactions, budgets, period), [transactions, budgets, period]);
+    const { budgetObj, livingExpense, incidentalExpense, livingTopUp, incidentalTopUp } = pb;
+    const remaining = pb.livingBalance;
+    const incidentalRemaining = pb.incidentalBalance;
     const chartData = EXPENSE_CATS.map((cat) => ({ name: cat, value: periodTx.filter((t) => t.type === "expense" && t.category === cat).reduce((s, t) => s + Number(t.amount), 0) })).filter((d) => d.value > 0);
     const isSettlementDay = new Date().getDate() === 15;
     return (React.createElement("div", { className: "flex flex-col gap-5 md:gap-6" },
@@ -3171,7 +3267,8 @@ function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTran
                             formatWon(livingExpense),
                             " / ",
                             formatWon(budgetObj.total),
-                            " \uC0AC\uC6A9"))),
+                            " \uC0AC\uC6A9",
+                            livingTopUp > 0 ? ` (+${formatWon(livingTopUp)} 입금)` : ""))),
                     budgetObj.total === 0 && React.createElement("div", { className: "text-xs mt-2", style: { color: C.muted } }, "\uC608\uC0B0\uC774 \uC124\uC815\uB418\uC9C0 \uC54A\uC558\uC5B4\uC694.")),
                 React.createElement("div", null,
                     React.createElement("div", { className: "text-xs md:text-sm", style: { color: C.muted } },
@@ -3185,7 +3282,7 @@ function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTran
                             " / ",
                             formatWon(budgetObj.incidental),
                             " \uC0AC\uC6A9",
-                            incidentalIncome > 0 ? ` (+${formatWon(incidentalIncome)} 입금)` : ""))),
+                            incidentalTopUp > 0 ? ` (+${formatWon(incidentalTopUp)} 입금)` : ""))),
                     budgetObj.incidental === 0 && React.createElement("div", { className: "text-xs mt-2", style: { color: C.muted } }, "\uC608\uC0B0\uC774 \uC124\uC815\uB418\uC9C0 \uC54A\uC558\uC5B4\uC694.")))),
         periodSalaryTx.length > 0 && (React.createElement(Card, null,
             React.createElement(SectionTitle, null, "\uC774\uBC88 \uACB0\uC0B0 \uAE09\uC5EC \uB0B4\uC5ED"),
