@@ -30,6 +30,9 @@ function usePocketNames() {
         incidental: (v && typeof v.incidental === "string" && v.incidental.trim()) ? v.incidental : POCKET_DEFAULTS.incidental,
     };
 }
+// 결산 시작일도 같은 방식으로 화면 전체에 전달한다.
+const SettleDayCtx = React.createContext(16);
+function useSettleDay() { return normSettleDay(React.useContext(SettleDayCtx)); }
 const EXPENSE_CATS = ["식비", "교통", "주거/관리비", "통신", "문화/여가", "의료/건강", "교육", "쇼핑", "경조사", "품위유지비", "기타"];
 const INCOME_CATS = ["급여", "부수입", "이자/배당", "환급/기타"];
 const ACCOUNT_TYPES = ["입출금", "예금", "적금", "투자", "현금", "카드"];
@@ -121,16 +124,33 @@ function computeSavingsValue(s) {
     const months = matured ? monthsElapsed(s.startDate, s.targetDate) : monthsElapsed(s.startDate, now);
     return principal + deposit * months;
 }
-// ---------- 결산 기간(매월 16일 ~ 다음달 15일) ----------
-function periodFromStartMonth(year, month) { return { start: new Date(year, month, 16), end: new Date(year, month + 1, 15) }; }
-function getCurrentPeriod(refDate) {
-    refDate = refDate || new Date();
-    const d = refDate.getDate();
-    if (d <= 15)
-        return periodFromStartMonth(refDate.getFullYear(), refDate.getMonth() - 1);
-    return periodFromStartMonth(refDate.getFullYear(), refDate.getMonth());
+// ---------- 결산 기간 ----------
+// 기본은 매월 16일 ~ 다음달 15일. 카드 명세서 주기가 집집마다 달라서 설정에서 시작일을 바꿀 수 있다.
+// 시작일을 1로 두면 매월 1일 ~ 말일(= 달력 그대로)이 된다.
+const SETTLE_DAY_DEFAULT = 16;
+function normSettleDay(d) {
+    const n = Number(d);
+    if (!Number.isFinite(n))
+        return SETTLE_DAY_DEFAULT;
+    return Math.min(28, Math.max(1, Math.round(n)));
 }
-function shiftPeriod(period, dir) { return periodFromStartMonth(period.start.getFullYear(), period.start.getMonth() + dir); }
+function periodFromStartMonth(year, month, settleDay) {
+    const day = normSettleDay(settleDay);
+    // 끝나는 날은 "다음 시작일의 하루 전". day=1 이면 다음달 0일 = 이번달 말일이 되어 딱 맞는다.
+    return { start: new Date(year, month, day), end: new Date(year, month + 1, day - 1) };
+}
+function getCurrentPeriod(refDate, settleDay) {
+    refDate = refDate || new Date();
+    const day = normSettleDay(settleDay);
+    const d = refDate.getDate();
+    if (d < day)
+        return periodFromStartMonth(refDate.getFullYear(), refDate.getMonth() - 1, day);
+    return periodFromStartMonth(refDate.getFullYear(), refDate.getMonth(), day);
+}
+function shiftPeriod(period, dir, settleDay) {
+    const day = normSettleDay(settleDay != null ? settleDay : period.start.getDate());
+    return periodFromStartMonth(period.start.getFullYear(), period.start.getMonth() + dir, day);
+}
 function toDateStr(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; }
 function fmtShortDate(d) { return `${d.getMonth() + 1}/${d.getDate()}`; }
 function txInPeriod(transactions, period) {
@@ -569,7 +589,7 @@ async function pingServer(apiUrl, token) {
     return data;
 }
 // ---------- 백업 파일 내보내기 / 가져오기 ----------
-const DATA_KEYS = ["hh-title", "hh-pockets", "hh-gemini-shared", "hh-accounts", "hh-transactions", "hh-savings", "hh-insurance", "hh-fixed-expenses", "hh-events", "hh-todos", "hh-budget", "hh-transfers"];
+const DATA_KEYS = ["hh-title", "hh-pockets", "hh-settle-day", "hh-gemini-shared", "hh-accounts", "hh-transactions", "hh-savings", "hh-insurance", "hh-fixed-expenses", "hh-events", "hh-todos", "hh-budget", "hh-transfers"];
 async function exportBackupFile(dataObj) {
     const payload = { app: "우리집 가계부", version: 1, exportedAt: new Date().toISOString(), data: dataObj };
     const text = JSON.stringify(payload, null, 2);
@@ -1793,6 +1813,7 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
     const [showGemini, setShowGemini] = useState(false);
     const [titleDraft, setTitleDraft] = useState("");
     const [pocketDraft, setPocketDraft] = useState(POCKET_DEFAULTS);
+    const [settleDraft, setSettleDraft] = useState(SETTLE_DAY_DEFAULT);
     const [resetMode, setResetMode] = useState(null);
     const [resetBusy, setResetBusy] = useState(false);
     const [resetMsg, setResetMsg] = useState(null);
@@ -1871,6 +1892,7 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
     const [transfers, setTransfers] = useState([]);
     const [title, setTitle] = useState("우리집 가계부");
     const [pockets, setPockets] = useState(POCKET_DEFAULTS); // 두 지갑의 이름 (부부 공유)
+    const [settleDay, setSettleDay] = useState(SETTLE_DAY_DEFAULT); // 결산 시작일 (부부 공유)
     const [sharedGemini, setSharedGemini] = useState(""); // 배우자와 함께 쓰는 AI 키
     // 서버에 실제로 들어있는 값(문자열). 이 값과 같으면 다시 저장하지 않는다.
     // 예전에는 20초마다 데이터를 다시 불러올 때마다 9개 항목을 전부 재저장해서
@@ -1896,7 +1918,7 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
                 if (/NO_ALL|no key or action|UNKNOWN/i.test(m))
                     setStorageOld(true);
             }
-            let ttl, a, t, s, ins, fx, e, td, bg, tr, pk, gk;
+            let ttl, a, t, s, ins, fx, e, td, bg, tr, pk, gk, sd;
             if (bulk) {
                 for (const k of DATA_KEYS)
                     if (bulk[k] !== undefined)
@@ -1913,6 +1935,7 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
                 tr = bulk["hh-transfers"];
                 pk = bulk["hh-pockets"];
                 gk = bulk["hh-gemini-shared"];
+                sd = bulk["hh-settle-day"];
             }
             else {
                 [ttl, a, t, s, ins, fx, e, td, bg, tr] = await Promise.all([
@@ -1939,6 +1962,12 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
                 catch (e2) {
                     gk = "";
                 }
+                try {
+                    sd = await remoteLoad(cfg, "hh-settle-day", null);
+                }
+                catch (e2) {
+                    sd = null;
+                }
             }
             const safeTitle = typeof ttl === "string" && ttl.trim() ? ttl : "우리집 가계부";
             const safePockets = {
@@ -1946,6 +1975,7 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
                 incidental: (pk && typeof pk.incidental === "string" && pk.incidental.trim()) ? pk.incidental : POCKET_DEFAULTS.incidental,
             };
             const safeGemini = typeof gk === "string" ? gk : "";
+            const safeSettleDay = sd == null ? SETTLE_DAY_DEFAULT : normSettleDay(sd);
             const bgObj = bg && typeof bg === "object" && !Array.isArray(bg) ? bg : {};
             const next = {
                 "hh-title": safeTitle, "hh-accounts": a || [], "hh-transactions": t || [], "hh-savings": s || [],
@@ -1954,11 +1984,13 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
             };
             // 상태를 바꾸기 전에 스냅샷을 먼저 기록해야 저장 이펙트가 헛돌지 않는다.
             next["hh-pockets"] = safePockets;
+            next["hh-settle-day"] = safeSettleDay;
             next["hh-gemini-shared"] = safeGemini;
             for (const k of DATA_KEYS)
                 serverSnap.current[k] = JSON.stringify(next[k]);
             setTitle(safeTitle);
             setPockets(safePockets);
+            setSettleDay(safeSettleDay);
             setSharedGemini(safeGemini);
             // 배우자가 공유해 둔 키가 있고 이 PC 에 키가 없으면 그대로 가져다 쓴다.
             if (safeGemini && !cfg.geminiKey)
@@ -1989,6 +2021,7 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
                     living: (cachedPk && typeof cachedPk.living === "string" && cachedPk.living.trim()) ? cachedPk.living : POCKET_DEFAULTS.living,
                     incidental: (cachedPk && typeof cachedPk.incidental === "string" && cachedPk.incidental.trim()) ? cachedPk.incidental : POCKET_DEFAULTS.incidental,
                 });
+                setSettleDay(normSettleDay(c("hh-settle-day", SETTLE_DAY_DEFAULT).value));
                 setAccounts(ca.value);
                 setTransactions(ct.value);
                 setSavings(c("hh-savings", []).value);
@@ -2002,7 +2035,8 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
                 // 오프라인에서 화면을 캐시로 채운 것 자체가 "변경"으로 오해되어
                 // 곧바로 저장을 시도하지 않도록, 스냅샷을 화면에 올린 값과 똑같이 맞춰 둔다.
                 for (const k of DATA_KEYS) {
-                    const fb = k === "hh-budget" ? {} : k === "hh-title" ? "우리집 가계부" : k === "hh-pockets" ? POCKET_DEFAULTS : k === "hh-gemini-shared" ? "" : [];
+                    const fb = k === "hh-budget" ? {} : k === "hh-title" ? "우리집 가계부" : k === "hh-pockets" ? POCKET_DEFAULTS
+                        : k === "hh-settle-day" ? SETTLE_DAY_DEFAULT : k === "hh-gemini-shared" ? "" : [];
                     serverSnap.current[k] = JSON.stringify(cacheGet(k, fb).value);
                 }
             }
@@ -2060,6 +2094,8 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
     useEffect(() => { if (!loaded)
         return; safeSave("hh-pockets", pockets); }, [pockets]);
     useEffect(() => { if (!loaded)
+        return; safeSave("hh-settle-day", settleDay); }, [settleDay]);
+    useEffect(() => { if (!loaded)
         return; safeSave("hh-gemini-shared", sharedGemini); }, [sharedGemini]);
     useEffect(() => { if (!loaded)
         return; safeSave("hh-accounts", accounts); }, [accounts]);
@@ -2086,15 +2122,16 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
     const updateTransaction = (id, patch) => setTransactions((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)));
     const setBudgetForPeriod = (period, budgetObj) => setBudgets((prev) => ({ ...prev, [periodKey(period)]: budgetObj }));
     const totalSavingsCurrent = useMemo(() => savings.reduce((s, x) => s + computeSavingsValue(x), 0), [savings]);
-    const currentPeriodForAssets = useMemo(() => getCurrentPeriod(), []);
+    const currentPeriodForAssets = useMemo(() => getCurrentPeriod(new Date(), settleDay), [settleDay]);
     const liquidFundsForSidebar = useMemo(() => computeLiquidFunds(transactions, budgets, currentPeriodForAssets), [transactions, budgets, currentPeriodForAssets]);
     const totalAssets = totalSavingsCurrent + liquidFundsForSidebar;
     if (!loaded)
         return React.createElement("div", { className: "min-h-screen flex items-center justify-center", style: { background: C.bg, color: C.muted, fontFamily: SANS } }, "\uBD88\uB7EC\uC624\uB294 \uC911...");
     const currentLabel = NAV.find((n) => n.id === tab)?.label;
     return (React.createElement(PocketNamesCtx.Provider, { value: pockets },
-        React.createElement("div", { className: "min-h-screen flex", style: { background: C.bg, color: C.ink, fontFamily: SANS, backgroundImage: `radial-gradient(circle at 15% -10%, ${C.accentSoft}55, transparent 45%), radial-gradient(circle at 100% 0%, ${C.bgAlt}88, transparent 50%)` } },
-            React.createElement("style", null, `
+        React.createElement(SettleDayCtx.Provider, { value: settleDay },
+            React.createElement("div", { className: "min-h-screen flex", style: { background: C.bg, color: C.ink, fontFamily: SANS, backgroundImage: `radial-gradient(circle at 15% -10%, ${C.accentSoft}55, transparent 45%), radial-gradient(circle at 100% 0%, ${C.bgAlt}88, transparent 50%)` } },
+                React.createElement("style", null, `
         .lift-card:hover { transform: translateY(-3px); box-shadow: ${C.shadowLift}; }
         .focus-ring:focus { border-color: ${C.accent} !important; box-shadow: 0 0 0 3px ${C.accentSoft}; }
         .nav-btn { position: relative; overflow: hidden; }
@@ -2102,158 +2139,181 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
         .nav-btn:hover .nav-icon { transform: translateX(2px); }
         .desktop-wrap { max-width: 1440px; margin: 0 auto; width: 100%; }
       `),
-            React.createElement("aside", { className: "hidden md:flex md:flex-col w-64 shrink-0 p-5", style: { borderRight: `1px solid ${C.border}` } },
-                React.createElement("div", { className: "mb-8 px-2" },
-                    React.createElement("div", { className: "text-2xl font-semibold", style: { fontFamily: SERIF, letterSpacing: "-0.01em", wordBreak: "keep-all" } }, title)),
-                React.createElement("nav", { className: "flex flex-col gap-1" }, NAV.map((n) => {
+                React.createElement("aside", { className: "hidden md:flex md:flex-col w-64 shrink-0 p-5", style: { borderRight: `1px solid ${C.border}` } },
+                    React.createElement("div", { className: "mb-8 px-2" },
+                        React.createElement("div", { className: "text-2xl font-semibold", style: { fontFamily: SERIF, letterSpacing: "-0.01em", wordBreak: "keep-all" } }, title)),
+                    React.createElement("nav", { className: "flex flex-col gap-1" }, NAV.map((n) => {
+                        const IconComp = n.icon;
+                        const active = tab === n.id;
+                        return (React.createElement("button", { key: n.id, onClick: () => setTab(n.id), className: "nav-btn flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 text-left", style: { background: active ? C.ink : "transparent", color: active ? "#fff" : C.inkSoft, boxShadow: active ? "0 4px 12px -4px rgba(24,26,32,0.4)" : "none" } },
+                            React.createElement(IconComp, { size: 17, className: "nav-icon" }),
+                            n.label));
+                    })),
+                    React.createElement("div", { className: "mt-auto px-2 pt-6 text-xs", style: { color: C.muted } },
+                        "\uCD1D \uC790\uC0B0 ",
+                        React.createElement("span", { style: { fontFamily: SERIF, color: C.ink, fontWeight: 600 } },
+                            React.createElement(AnimatedNumber, { value: totalAssets })))),
+                React.createElement("div", { className: "flex-1 flex flex-col min-w-0 pb-16 md:pb-0" },
+                    React.createElement("header", { className: "px-4 md:px-8 py-4 md:py-5 flex items-center justify-between gap-3", style: { borderBottom: `1px solid ${C.border}` } },
+                        React.createElement("div", { className: "desktop-wrap flex items-center justify-between gap-3" },
+                            React.createElement("h1", { className: "text-xl md:text-3xl font-semibold shrink-0", style: { fontFamily: SERIF } }, currentLabel),
+                            React.createElement("div", { className: "flex items-center gap-2 md:gap-3 min-w-0" },
+                                syncError ? (React.createElement("div", { className: "flex items-center gap-1 text-xs shrink-0", style: { color: C.negative } },
+                                    React.createElement(IconWifiOff, { size: 13 }),
+                                    " ",
+                                    React.createElement("span", { className: "hidden sm:inline" }, syncError))) : (React.createElement("div", { className: "text-xs hidden sm:block shrink-0", style: { color: C.muted } }, lastSynced ? `${lastSynced.toLocaleTimeString("ko-KR")} 동기화됨` : "")),
+                                React.createElement(IconBtn, { onClick: () => reloadAll(true), title: "\uC0C8\uB85C\uACE0\uCE68" },
+                                    React.createElement(IconRefresh, { size: 16, style: { animation: syncing ? "spin 0.8s linear infinite" : "none" } })),
+                                React.createElement(IconBtn, { onClick: () => setShowHelp(true), title: "\uC0AC\uC6A9 \uC548\uB0B4" },
+                                    React.createElement(IconHelp, { size: 16 })),
+                                React.createElement(IconBtn, { onClick: () => { setTitleDraft(title); setPocketDraft(pockets); setSettleDraft(settleDay); setShowSettings(true); }, title: "\uC5F0\uACB0 \uC124\uC815" },
+                                    React.createElement(IconSettings, { size: 16 }))))),
+                    React.createElement("main", { key: tab, className: "flex-1 min-w-0 p-4 md:p-8 overflow-y-auto fade-in-up" },
+                        React.createElement("div", { className: "desktop-wrap" },
+                            storageOld && (React.createElement("div", { className: "rounded-xl p-3 mb-4 flex items-center justify-between gap-3 flex-wrap", style: { background: C.accentSoft, border: `1px solid ${C.accent}` } },
+                                React.createElement("div", { className: "text-sm", style: { color: C.accentDeep } },
+                                    React.createElement("b", null, "\uC800\uC7A5\uC18C\uB97C \uC5C5\uB370\uC774\uD2B8\uD558\uBA74 \uB354 \uBE68\uB77C\uC9D1\uB2C8\uB2E4."),
+                                    " \uC9C0\uAE08\uB3C4 \uC4F8 \uC218 \uC788\uC9C0\uB9CC \uB3D9\uAE30\uD654\uAC00 \uB290\uB9AC\uACE0 \uC800\uC7A5 \uC2E4\uD328\uAC00 \uC0DD\uAE38 \uC218 \uC788\uC5B4\uC694."),
+                                React.createElement("button", { onClick: () => setShowUpdate(true), className: "px-3 py-2 rounded-lg text-sm font-medium shrink-0", style: { background: C.accent, color: "#fff" } }, "3\uBD84\uB9CC\uC5D0 \uC5C5\uB370\uC774\uD2B8\uD558\uAE30"))),
+                            tab === "dashboard" && React.createElement(Dashboard, { transactions: transactions, savings: savings, events: events, todos: todos, budgets: budgets, totalSavingsCurrent: totalSavingsCurrent }),
+                            tab === "savings" && React.createElement(SavingsInvestTab, { savings: savings, setSavings: setSavings, accounts: accounts }),
+                            tab === "insurance" && React.createElement(FixedCostsTab, { insurances: insurances, setInsurances: setInsurances, fixedExpenses: fixedExpenses, setFixedExpenses: setFixedExpenses, accounts: accounts }),
+                            tab === "expenses" && React.createElement(ExpensesTab, { transactions: transactions, addTransaction: addTransaction, addTransactions: addTransactions, deleteTransaction: deleteTransaction, updateTransaction: updateTransaction, cfg: cfg, onOpenSettings: () => setShowGemini(true), budgets: budgets, setBudgetForPeriod: setBudgetForPeriod }),
+                            tab === "calendar" && React.createElement(CalendarTab, { events: events, setEvents: setEvents }),
+                            tab === "todo" && React.createElement(TodoTab, { todos: todos, setTodos: setTodos }),
+                            tab === "accounts" && React.createElement(AccountsTab, { accounts: accounts, setAccounts: setAccounts, transfers: transfers, setTransfers: setTransfers, insurances: insurances, fixedExpenses: fixedExpenses, savings: savings })))),
+                React.createElement("nav", { className: "md:hidden fixed bottom-0 left-0 right-0 flex z-10", style: { background: C.surface, borderTop: `1px solid ${C.border}`, boxShadow: "0 -4px 16px rgba(24,26,32,0.06)", paddingBottom: "env(safe-area-inset-bottom, 0px)" } }, NAV.map((n) => {
                     const IconComp = n.icon;
                     const active = tab === n.id;
-                    return (React.createElement("button", { key: n.id, onClick: () => setTab(n.id), className: "nav-btn flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 text-left", style: { background: active ? C.ink : "transparent", color: active ? "#fff" : C.inkSoft, boxShadow: active ? "0 4px 12px -4px rgba(24,26,32,0.4)" : "none" } },
-                        React.createElement(IconComp, { size: 17, className: "nav-icon" }),
-                        n.label));
+                    return (React.createElement("button", { key: n.id, onClick: () => setTab(n.id), className: "flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 py-2 transition-transform duration-150", style: { transform: active ? "translateY(-2px)" : "none" } },
+                        React.createElement(IconComp, { size: 18, color: active ? C.ink : C.muted }),
+                        React.createElement("span", { className: "text-[9.5px] leading-tight truncate w-full text-center px-0.5", style: { color: active ? C.ink : C.muted, fontWeight: active ? 600 : 400 } }, n.shortLabel)));
                 })),
-                React.createElement("div", { className: "mt-auto px-2 pt-6 text-xs", style: { color: C.muted } },
-                    "\uCD1D \uC790\uC0B0 ",
-                    React.createElement("span", { style: { fontFamily: SERIF, color: C.ink, fontWeight: 600 } },
-                        React.createElement(AnimatedNumber, { value: totalAssets })))),
-            React.createElement("div", { className: "flex-1 flex flex-col min-w-0 pb-16 md:pb-0" },
-                React.createElement("header", { className: "px-4 md:px-8 py-4 md:py-5 flex items-center justify-between gap-3", style: { borderBottom: `1px solid ${C.border}` } },
-                    React.createElement("div", { className: "desktop-wrap flex items-center justify-between gap-3" },
-                        React.createElement("h1", { className: "text-xl md:text-3xl font-semibold shrink-0", style: { fontFamily: SERIF } }, currentLabel),
-                        React.createElement("div", { className: "flex items-center gap-2 md:gap-3 min-w-0" },
-                            syncError ? (React.createElement("div", { className: "flex items-center gap-1 text-xs shrink-0", style: { color: C.negative } },
-                                React.createElement(IconWifiOff, { size: 13 }),
-                                " ",
-                                React.createElement("span", { className: "hidden sm:inline" }, syncError))) : (React.createElement("div", { className: "text-xs hidden sm:block shrink-0", style: { color: C.muted } }, lastSynced ? `${lastSynced.toLocaleTimeString("ko-KR")} 동기화됨` : "")),
-                            React.createElement(IconBtn, { onClick: () => reloadAll(true), title: "\uC0C8\uB85C\uACE0\uCE68" },
-                                React.createElement(IconRefresh, { size: 16, style: { animation: syncing ? "spin 0.8s linear infinite" : "none" } })),
-                            React.createElement(IconBtn, { onClick: () => setShowHelp(true), title: "\uC0AC\uC6A9 \uC548\uB0B4" },
-                                React.createElement(IconHelp, { size: 16 })),
-                            React.createElement(IconBtn, { onClick: () => { setTitleDraft(title); setPocketDraft(pockets); setShowSettings(true); }, title: "\uC5F0\uACB0 \uC124\uC815" },
-                                React.createElement(IconSettings, { size: 16 }))))),
-                React.createElement("main", { key: tab, className: "flex-1 min-w-0 p-4 md:p-8 overflow-y-auto fade-in-up" },
-                    React.createElement("div", { className: "desktop-wrap" },
-                        storageOld && (React.createElement("div", { className: "rounded-xl p-3 mb-4 flex items-center justify-between gap-3 flex-wrap", style: { background: C.accentSoft, border: `1px solid ${C.accent}` } },
-                            React.createElement("div", { className: "text-sm", style: { color: C.accentDeep } },
-                                React.createElement("b", null, "\uC800\uC7A5\uC18C\uB97C \uC5C5\uB370\uC774\uD2B8\uD558\uBA74 \uB354 \uBE68\uB77C\uC9D1\uB2C8\uB2E4."),
-                                " \uC9C0\uAE08\uB3C4 \uC4F8 \uC218 \uC788\uC9C0\uB9CC \uB3D9\uAE30\uD654\uAC00 \uB290\uB9AC\uACE0 \uC800\uC7A5 \uC2E4\uD328\uAC00 \uC0DD\uAE38 \uC218 \uC788\uC5B4\uC694."),
-                            React.createElement("button", { onClick: () => setShowUpdate(true), className: "px-3 py-2 rounded-lg text-sm font-medium shrink-0", style: { background: C.accent, color: "#fff" } }, "3\uBD84\uB9CC\uC5D0 \uC5C5\uB370\uC774\uD2B8\uD558\uAE30"))),
-                        tab === "dashboard" && React.createElement(Dashboard, { transactions: transactions, savings: savings, events: events, todos: todos, budgets: budgets, totalSavingsCurrent: totalSavingsCurrent }),
-                        tab === "savings" && React.createElement(SavingsInvestTab, { savings: savings, setSavings: setSavings, accounts: accounts }),
-                        tab === "insurance" && React.createElement(FixedCostsTab, { insurances: insurances, setInsurances: setInsurances, fixedExpenses: fixedExpenses, setFixedExpenses: setFixedExpenses, accounts: accounts }),
-                        tab === "expenses" && React.createElement(ExpensesTab, { transactions: transactions, addTransaction: addTransaction, addTransactions: addTransactions, deleteTransaction: deleteTransaction, updateTransaction: updateTransaction, cfg: cfg, onOpenSettings: () => setShowGemini(true), budgets: budgets, setBudgetForPeriod: setBudgetForPeriod }),
-                        tab === "calendar" && React.createElement(CalendarTab, { events: events, setEvents: setEvents }),
-                        tab === "todo" && React.createElement(TodoTab, { todos: todos, setTodos: setTodos }),
-                        tab === "accounts" && React.createElement(AccountsTab, { accounts: accounts, setAccounts: setAccounts, transfers: transfers, setTransfers: setTransfers, insurances: insurances, fixedExpenses: fixedExpenses, savings: savings })))),
-            React.createElement("nav", { className: "md:hidden fixed bottom-0 left-0 right-0 flex z-10", style: { background: C.surface, borderTop: `1px solid ${C.border}`, boxShadow: "0 -4px 16px rgba(24,26,32,0.06)", paddingBottom: "env(safe-area-inset-bottom, 0px)" } }, NAV.map((n) => {
-                const IconComp = n.icon;
-                const active = tab === n.id;
-                return (React.createElement("button", { key: n.id, onClick: () => setTab(n.id), className: "flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 py-2 transition-transform duration-150", style: { transform: active ? "translateY(-2px)" : "none" } },
-                    React.createElement(IconComp, { size: 18, color: active ? C.ink : C.muted }),
-                    React.createElement("span", { className: "text-[9.5px] leading-tight truncate w-full text-center px-0.5", style: { color: active ? C.ink : C.muted, fontWeight: active ? 600 : 400 } }, n.shortLabel)));
-            })),
-            showSettings && (React.createElement("div", { className: "fixed inset-0 flex items-center justify-center p-6 z-20", style: { background: "rgba(24,26,32,0.45)" } },
-                React.createElement(Card, { style: { maxWidth: 460, maxHeight: "88vh", overflowY: "auto" }, className: "w-full relative fade-in-up" },
-                    React.createElement("div", { className: "flex justify-end" },
-                        React.createElement(IconBtn, { onClick: () => { setShowSettings(false); setIoMsg(null); setResetMode(null); setResetMsg(null); }, title: "\uB2EB\uAE30" },
-                            React.createElement(IconX, { size: 16 }))),
-                    React.createElement("h3", { className: "text-base font-semibold mb-3", style: { fontFamily: SERIF } }, "\uC124\uC815"),
-                    React.createElement("p", { className: "text-sm font-medium mb-1" }, "\uAC00\uACC4\uBD80 \uC774\uB984"),
-                    React.createElement("p", { className: "text-xs mb-2", style: { color: C.muted } }, "\uC67C\uCABD \uC704\uC5D0 \uD45C\uC2DC\uB418\uB294 \uC774\uB984\uC785\uB2C8\uB2E4. \uBC30\uC6B0\uC790 \uD654\uBA74\uC5D0\uB3C4 \uB611\uAC19\uC774 \uC801\uC6A9\uB429\uB2C8\uB2E4."),
-                    React.createElement("div", { className: "flex gap-2 mb-5" },
-                        React.createElement(TextInput, { value: titleDraft, onChange: (e) => setTitleDraft(e.target.value), placeholder: "\uC608: \uC6B0\uB9AC\uC9D1 \uAC00\uACC4\uBD80", maxLength: 24 }),
-                        React.createElement(PrimaryBtn, { onClick: () => { const v = titleDraft.trim(); if (v)
-                                setTitle(v); } }, "\uBCC0\uACBD")),
-                    React.createElement("p", { className: "text-sm font-medium mb-1" }, "\uC9C0\uAC11 \uC774\uB984"),
-                    React.createElement("p", { className: "text-xs mb-2 leading-relaxed", style: { color: C.muted } }, "\uC0DD\uD65C\uBE44\uB97C \uB450 \uAC08\uB798\uB85C \uB098\uB220\uC11C \uAD00\uB9AC\uD569\uB2C8\uB2E4. \uC6B0\uB9AC \uC9D1\uC5D0\uC11C \uBD80\uB974\uB294 \uB9D0\uB85C \uBC14\uAFD4 \uC4F0\uC138\uC694. (\uC608: \uC0DD\uD65C\uBE44 / \uD488\uC704\uC720\uC9C0\uBE44, \uACF5\uB3D9 / \uAC1C\uC778, \uACE0\uC815\uBE44 / \uC5EC\uC720\uBE44)"),
-                    React.createElement("div", { className: "grid grid-cols-2 gap-2 mb-2" },
-                        React.createElement(TextInput, { value: pocketDraft.living, onChange: (e) => setPocketDraft({ ...pocketDraft, living: e.target.value }), placeholder: POCKET_DEFAULTS.living, maxLength: 12 }),
-                        React.createElement(TextInput, { value: pocketDraft.incidental, onChange: (e) => setPocketDraft({ ...pocketDraft, incidental: e.target.value }), placeholder: POCKET_DEFAULTS.incidental, maxLength: 12 })),
-                    React.createElement("div", { className: "flex gap-2 mb-5" },
-                        React.createElement("button", { onClick: () => setPocketDraft(POCKET_DEFAULTS), className: "px-3 py-2 rounded-lg text-sm", style: { background: "#EFEAE0", color: C.inkSoft } }, "\uAE30\uBCF8\uAC12"),
-                        React.createElement(PrimaryBtn, { onClick: () => {
-                                const l = (pocketDraft.living || "").trim(), i = (pocketDraft.incidental || "").trim();
-                                if (!l || !i)
-                                    return;
-                                setPockets({ living: l, incidental: i });
-                            } }, "\uC9C0\uAC11 \uC774\uB984 \uBCC0\uACBD")),
-                    React.createElement("p", { className: "text-xs mb-2", style: { color: C.muted } }, "\uC774 \uAE30\uAE30\uAC00 \uC5F0\uACB0\uB41C \uC800\uC7A5\uC18C \uC8FC\uC18C"),
-                    React.createElement("div", { className: "text-xs mb-3 p-2.5 rounded-lg", style: { background: "#FAF9F6", color: C.inkSoft, fontFamily: "monospace", wordBreak: "break-all", border: `1px solid ${C.border}` } }, cfg.apiUrl),
-                    React.createElement("button", { onClick: async () => { const ok = await copyText(pairCode); setPairCopied(ok); setTimeout(() => setPairCopied(false), 2000); }, className: "w-full py-2.5 rounded-lg text-sm font-medium mb-1.5", style: { background: pairCopied ? C.positiveSoft : C.ink, color: pairCopied ? C.positive : "#fff" } }, pairCopied ? "✓ 연결코드를 복사했어요" : "배우자에게 연결코드 보내기"),
-                    React.createElement("p", { className: "text-xs mb-3", style: { color: C.muted } }, "\uBCF5\uC0AC\uB41C \uCF54\uB4DC\uB97C \uBC30\uC6B0\uC790\uC5D0\uAC8C \uC804\uB2EC\uD558\uBA74, \uBC30\uC6B0\uC790 \uC571\uC758 \uCCAB \uD654\uBA74\uC5D0\uC11C \uBD99\uC5EC\uB123\uAE30\uB9CC\uC73C\uB85C \uAC19\uC740 \uAC00\uACC4\uBD80\uC5D0 \uC5F0\uACB0\uB429\uB2C8\uB2E4."),
-                    mobileLink(pairCode) && (React.createElement("div", { className: "rounded-xl p-3.5 mb-3", style: { background: "#FAF9F6", border: `1px solid ${C.border}` } },
-                        React.createElement("div", { className: "text-sm font-semibold mb-1", style: { color: C.ink } }, "\uD734\uB300\uD3F0\uC5D0\uC11C \uC4F0\uAE30"),
-                        React.createElement("p", { className: "text-xs mb-3", style: { color: C.muted } },
-                            "\uD734\uB300\uD3F0 \uCE74\uBA54\uB77C\uB85C \uC544\uB798 QR \uC744 \uCC0D\uC73C\uBA74 \uAC19\uC740 \uAC00\uACC4\uBD80\uAC00 \uBC14\uB85C \uC5F4\uB9BD\uB2C8\uB2E4. \uC124\uCE58 \uC5C6\uC774 \uC4F0\uACE0, \uBE0C\uB77C\uC6B0\uC800 \uBA54\uB274\uC758 ",
-                            React.createElement("b", null, "\uD648 \uD654\uBA74\uC5D0 \uCD94\uAC00"),
-                            " \uB97C \uB204\uB974\uBA74 \uC571\uCC98\uB7FC \uC544\uC774\uCF58\uC774 \uC0DD\uAE41\uB2C8\uB2E4."),
-                        React.createElement(QrCode, { text: mobileLink(pairCode), size: 190, caption: "\uCE74\uBA54\uB77C \uC571\uC73C\uB85C \uCC0D\uC73C\uC138\uC694" }),
-                        React.createElement("button", { onClick: async () => { const ok = await copyText(mobileLink(pairCode)); setMobileCopied(ok); setTimeout(() => setMobileCopied(false), 2000); }, className: "w-full py-2 rounded-lg text-sm font-medium mt-3", style: { background: mobileCopied ? C.positiveSoft : "#EFEAE0", color: mobileCopied ? C.positive : C.inkSoft } }, mobileCopied ? "✓ 주소를 복사했어요" : "휴대폰용 주소 복사 (카톡으로 보내기)"),
-                        React.createElement("p", { className: "text-xs mt-2", style: { color: C.negative } }, "\uC774 QR \uC5D0\uB294 \uB0B4 \uAC00\uACC4\uBD80 \uC5F4\uC1E0\uAC00 \uB4E4\uC5B4 \uC788\uC2B5\uB2C8\uB2E4. \uB2E4\uB978 \uC0AC\uB78C\uC5D0\uAC8C \uBCF4\uC5EC\uC8FC\uC9C0 \uB9C8\uC138\uC694."))),
-                    !resetMode ? (React.createElement("button", { onClick: () => { setResetMode("menu"); setResetMsg(null); }, className: "w-full py-2 rounded-lg text-sm font-medium", style: { background: "#EFEAE0", color: C.inkSoft } }, "\uCD08\uAE30\uD654 \u00B7 \uB2E4\uB978 \uC800\uC7A5\uC18C\uB85C \uB2E4\uC2DC \uC5F0\uACB0")) : (React.createElement("div", { className: "rounded-xl p-3.5", style: { background: "#FAF9F6", border: `1px solid ${C.border}` } },
-                        React.createElement("div", { className: "flex items-center justify-between mb-2" },
-                            React.createElement("div", { className: "text-sm font-semibold", style: { color: C.ink } }, "\uCD08\uAE30\uD654"),
-                            React.createElement("button", { onClick: () => { setResetMode(null); setResetMsg(null); }, className: "text-xs", style: { color: C.muted } }, "\uCDE8\uC18C")),
-                        React.createElement("button", { onClick: () => { if (window.confirm("이 PC 의 연결 정보와 AI 키를 지우고 처음 설정 화면으로 돌아갑니다.\n구글 시트의 가계부 내용은 그대로 남습니다."))
-                                onChangeServer({ keepGeminiKey: false }); }, className: "w-full text-left px-3 py-2.5 rounded-lg mb-2", style: { background: C.surface, border: `1px solid ${C.border}` } },
-                            React.createElement("div", { className: "text-sm font-medium", style: { color: C.ink } }, "\uC774 PC \uB9CC \uCD08\uAE30\uD654"),
-                            React.createElement("div", { className: "text-xs mt-0.5", style: { color: C.muted } },
-                                "\uC5F0\uACB0 \uC8FC\uC18C\u00B7AI \uD0A4\u00B7\uC774 PC \uC5D0 \uC800\uC7A5\uB41C \uC815\uBCF4\uB97C \uC9C0\uC6B0\uACE0 \uCC98\uC74C \uC124\uC815\uBD80\uD130 \uB2E4\uC2DC \uD569\uB2C8\uB2E4. ",
-                                React.createElement("b", null, "\uAD6C\uAE00 \uC2DC\uD2B8 \uB0B4\uC6A9\uC740 \uB0A8\uC2B5\uB2C8\uB2E4."))),
-                        React.createElement("button", { onClick: async () => {
-                                if (!window.confirm("구글 시트에 저장된 가계부 내용을 모두 지웁니다.\n거래내역·계좌·예적금·일정·AI 키가 전부 사라지며 되돌릴 수 없습니다.\n\n계속할까요?"))
-                                    return;
-                                if (!window.confirm("정말 지웁니다. 배우자 화면에서도 사라집니다.\n필요하면 먼저 [백업 파일로 내보내기] 를 해두세요.\n\n마지막 확인입니다."))
-                                    return;
-                                setResetBusy(true);
-                                setResetMsg({ ok: true, text: "지우는 중입니다. 최대 1분 정도 걸릴 수 있어요." });
-                                pendingSaves.current += 1; // 지우는 동안 자동 동기화를 멈춘다
-                                try {
-                                    const r = await remoteClearAll(cfg, (i, n) => setResetMsg({ ok: true, text: `지우는 중... (${i}/${n})` }));
-                                    setResetMsg({ ok: true, text: (r.mode === "slow" ? "예전 버전 저장소라 하나씩 지웠습니다. " : "") + "완료되었습니다. 잠시 후 처음 설정 화면으로 돌아갑니다." });
-                                    setTimeout(() => onChangeServer({ keepGeminiKey: false }), 1400);
-                                }
-                                catch (e) {
-                                    const msg = String((e && e.message) || "네트워크를 확인해주세요");
-                                    setResetMsg({ ok: false, text: "삭제 실패 — " + msg + (/시간이 초과|LOCK_TIMEOUT/.test(msg) ? " · 구글 시트에서 KV 시트 탭을 직접 삭제해도 같은 효과입니다." : "") });
-                                }
-                                finally {
-                                    pendingSaves.current = Math.max(0, pendingSaves.current - 1);
-                                    setResetBusy(false);
-                                }
-                            }, disabled: resetBusy, className: "w-full text-left px-3 py-2.5 rounded-lg", style: { background: C.negativeSoft, border: `1px solid ${C.negative}`, opacity: resetBusy ? 0.6 : 1 } },
-                            React.createElement("div", { className: "text-sm font-medium", style: { color: C.negative } }, resetBusy ? "지우는 중..." : "구글 시트 데이터까지 전부 삭제"),
-                            React.createElement("div", { className: "text-xs mt-0.5", style: { color: C.negative } }, "\uAC00\uACC4\uBD80 \uB0B4\uC6A9\u00B7AI \uD0A4\u00B7\uC5F0\uACB0 \uC815\uBCF4\uAC00 \uBAA8\uB450 \uC0AC\uB77C\uC9D1\uB2C8\uB2E4. \uB418\uB3CC\uB9B4 \uC218 \uC5C6\uACE0 \uBC30\uC6B0\uC790 \uD654\uBA74\uC5D0\uC11C\uB3C4 \uC0AC\uB77C\uC9D1\uB2C8\uB2E4.")),
-                        resetMsg && React.createElement("div", { className: "text-xs mt-2", style: { color: resetMsg.ok ? C.positive : C.negative } }, resetMsg.text))),
-                    React.createElement("div", { className: "mt-5 pt-4", style: { borderTop: `1px dashed ${C.border}` } },
-                        React.createElement("p", { className: "text-sm font-medium mb-1" }, "Gemini API \uD0A4 (\uC601\uC218\uC99D \uC790\uB3D9\uC778\uC2DD\uC6A9)"),
-                        React.createElement("p", { className: "text-xs mb-2 leading-relaxed", style: { color: C.muted } }, "\uC601\uC218\uC99D\u00B7\uCE74\uB4DC\uB0B4\uC5ED \uC774\uBBF8\uC9C0\uB294 \uC774 PC \uC5D0\uC11C \uAD6C\uAE00 Gemini \uB85C \uC9C1\uC811 \uC804\uC1A1\uB429\uB2C8\uB2E4. \uAC1C\uC778\uC6A9 \uBB34\uB8CC \uC0AC\uC6A9\uB7C9 \uC548\uC5D0\uC11C \uB300\uAC1C \uC694\uAE08\uC774 \uBC1C\uC0DD\uD558\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4. \uD0A4\uB97C \uB123\uC9C0 \uC54A\uC544\uB3C4 \uC9C1\uC811 \uC785\uB825\uC73C\uB85C \uAC00\uACC4\uBD80\uB97C \uC4F8 \uC218 \uC788\uC5B4\uC694."),
-                        React.createElement("div", { className: "flex gap-2" },
-                            React.createElement(TextInput, { type: "password", value: geminiKeyDraft, onChange: (e) => setGeminiKeyDraft(e.target.value), placeholder: "AIzaSy..." }),
-                            React.createElement(PrimaryBtn, { onClick: () => { const k = geminiKeyDraft.trim(); onSaveGeminiKey(k); setSharedGemini(k); } }, "\uC800\uC7A5")),
-                        React.createElement("p", { className: "text-xs mt-1.5", style: { color: C.positive } }, "\uC800\uC7A5\uD558\uBA74 \uBC30\uC6B0\uC790 \uAE30\uAE30\uC5D0\uB3C4 \uC790\uB3D9\uC73C\uB85C \uC801\uC6A9\uB429\uB2C8\uB2E4. \uBC30\uC6B0\uC790\uAC00 \uB530\uB85C \uBC1C\uAE09\uBC1B\uC744 \uD544\uC694\uAC00 \uC5C6\uC5B4\uC694."),
-                        sharedGemini && (React.createElement("button", { onClick: () => { setSharedGemini(""); }, className: "text-xs mt-1", style: { color: C.muted, textDecoration: "underline" } }, "\uACF5\uC720 \uD574\uC81C (\uB0B4 \uAE30\uAE30\uC5D0\uC11C\uB9CC \uC0AC\uC6A9)")),
-                        React.createElement("button", { onClick: () => { setShowSettings(false); setShowGemini(true); }, className: "w-full py-2 rounded-lg text-sm font-medium mt-2", style: { background: C.accentSoft, color: C.accentDeep } }, "\uD0A4 \uBC1B\uB294 \uBC95 \uC790\uC138\uD788 \uBCF4\uAE30 (\uADF8\uB9BC \uC124\uBA85)"),
-                        cfg.geminiKey && React.createElement("div", { className: "text-xs mt-2", style: { color: C.positive } }, "\u2713 \uD0A4\uAC00 \uC800\uC7A5\uB418\uC5B4 \uC788\uC5B4\uC694")),
-                    React.createElement("div", { className: "mt-5 pt-4", style: { borderTop: `1px dashed ${C.border}` } },
-                        React.createElement("p", { className: "text-sm font-medium mb-1" }, "\uBC31\uC5C5 / \uBCF5\uC6D0"),
-                        React.createElement("p", { className: "text-xs mb-2 leading-relaxed", style: { color: C.muted } }, "\uC804\uCCB4 \uAC00\uACC4\uBD80\uB97C \uD30C\uC77C \uD558\uB098\uB85C \uC800\uC7A5\uD574 \uB458 \uC218 \uC788\uC5B4\uC694. \uC800\uC7A5\uC18C\uB97C \uC62E\uAE30\uAC70\uB098 \uC2E4\uC218\uB85C \uC9C0\uC6E0\uC744 \uB54C \uADF8\uB300\uB85C \uB418\uB3CC\uB9BD\uB2C8\uB2E4."),
-                        React.createElement("div", { className: "flex gap-2" },
-                            React.createElement("button", { onClick: doExport, className: "flex-1 py-2 rounded-lg text-sm font-medium", style: { background: "#EFEAE0", color: C.inkSoft } }, "\uBC31\uC5C5 \uD30C\uC77C\uB85C \uB0B4\uBCF4\uB0B4\uAE30"),
-                            React.createElement("button", { onClick: doImport, className: "flex-1 py-2 rounded-lg text-sm font-medium", style: { background: "#EFEAE0", color: C.inkSoft } }, "\uBC31\uC5C5 \uD30C\uC77C\uC5D0\uC11C \uBCF5\uC6D0")),
-                        ioMsg && React.createElement("div", { className: "text-xs mt-2", style: { color: ioMsg.ok ? C.positive : C.negative } }, ioMsg.text),
-                        React.createElement("p", { className: "text-xs mt-2", style: { color: C.muted } }, "\uBCF5\uC6D0\uD558\uBA74 \uD604\uC7AC \uAC00\uACC4\uBD80 \uB0B4\uC6A9\uC744 \uBC31\uC5C5 \uD30C\uC77C \uB0B4\uC6A9\uC73C\uB85C \uB36E\uC5B4\uC501\uB2C8\uB2E4.")),
-                    React.createElement("div", { className: "mt-5 pt-4", style: { borderTop: `1px dashed ${C.border}` } },
-                        React.createElement("button", { onClick: () => { setShowSettings(false); setShowHelp(true); }, className: "w-full py-2 rounded-lg text-sm font-medium", style: { background: "#EFEAE0", color: C.inkSoft } }, "\uC0AC\uC6A9 \uC548\uB0B4 \uB2E4\uC2DC \uBCF4\uAE30"))))),
-            showHelp && React.createElement(HelpModal, { onClose: () => setShowHelp(false), onGoTab: (id) => setTab(id) }),
-            showGemini && React.createElement(GeminiGuideModal, { onClose: () => setShowGemini(false), currentKey: cfg.geminiKey, onSave: (k) => { onSaveGeminiKey(k); setGeminiKeyDraft(k); setSharedGemini(k); } }),
-            showUpdate && React.createElement(StorageUpdateModal, { cfg: cfg, onClose: () => setShowUpdate(false), onRecheck: () => { setStorageOld(false); reloadAll(true); } }))));
+                showSettings && (React.createElement("div", { className: "fixed inset-0 flex items-center justify-center p-6 z-20", style: { background: "rgba(24,26,32,0.45)" } },
+                    React.createElement(Card, { style: { maxWidth: 460, maxHeight: "88vh", overflowY: "auto" }, className: "w-full relative fade-in-up" },
+                        React.createElement("div", { className: "flex justify-end" },
+                            React.createElement(IconBtn, { onClick: () => { setShowSettings(false); setIoMsg(null); setResetMode(null); setResetMsg(null); }, title: "\uB2EB\uAE30" },
+                                React.createElement(IconX, { size: 16 }))),
+                        React.createElement("h3", { className: "text-base font-semibold mb-3", style: { fontFamily: SERIF } }, "\uC124\uC815"),
+                        React.createElement("p", { className: "text-sm font-medium mb-1" }, "\uAC00\uACC4\uBD80 \uC774\uB984"),
+                        React.createElement("p", { className: "text-xs mb-2", style: { color: C.muted } }, "\uC67C\uCABD \uC704\uC5D0 \uD45C\uC2DC\uB418\uB294 \uC774\uB984\uC785\uB2C8\uB2E4. \uBC30\uC6B0\uC790 \uD654\uBA74\uC5D0\uB3C4 \uB611\uAC19\uC774 \uC801\uC6A9\uB429\uB2C8\uB2E4."),
+                        React.createElement("div", { className: "flex gap-2 mb-5" },
+                            React.createElement(TextInput, { value: titleDraft, onChange: (e) => setTitleDraft(e.target.value), placeholder: "\uC608: \uC6B0\uB9AC\uC9D1 \uAC00\uACC4\uBD80", maxLength: 24 }),
+                            React.createElement(PrimaryBtn, { onClick: () => { const v = titleDraft.trim(); if (v)
+                                    setTitle(v); } }, "\uBCC0\uACBD")),
+                        React.createElement("p", { className: "text-sm font-medium mb-1" }, "\uC9C0\uAC11 \uC774\uB984"),
+                        React.createElement("p", { className: "text-xs mb-2 leading-relaxed", style: { color: C.muted } }, "\uC0DD\uD65C\uBE44\uB97C \uB450 \uAC08\uB798\uB85C \uB098\uB220\uC11C \uAD00\uB9AC\uD569\uB2C8\uB2E4. \uC6B0\uB9AC \uC9D1\uC5D0\uC11C \uBD80\uB974\uB294 \uB9D0\uB85C \uBC14\uAFD4 \uC4F0\uC138\uC694. (\uC608: \uC0DD\uD65C\uBE44 / \uD488\uC704\uC720\uC9C0\uBE44, \uACF5\uB3D9 / \uAC1C\uC778, \uACE0\uC815\uBE44 / \uC5EC\uC720\uBE44)"),
+                        React.createElement("div", { className: "grid grid-cols-2 gap-2 mb-2" },
+                            React.createElement(TextInput, { value: pocketDraft.living, onChange: (e) => setPocketDraft({ ...pocketDraft, living: e.target.value }), placeholder: POCKET_DEFAULTS.living, maxLength: 12 }),
+                            React.createElement(TextInput, { value: pocketDraft.incidental, onChange: (e) => setPocketDraft({ ...pocketDraft, incidental: e.target.value }), placeholder: POCKET_DEFAULTS.incidental, maxLength: 12 })),
+                        React.createElement("div", { className: "flex gap-2 mb-5" },
+                            React.createElement("button", { onClick: () => setPocketDraft(POCKET_DEFAULTS), className: "px-3 py-2 rounded-lg text-sm", style: { background: "#EFEAE0", color: C.inkSoft } }, "\uAE30\uBCF8\uAC12"),
+                            React.createElement(PrimaryBtn, { onClick: () => {
+                                    const l = (pocketDraft.living || "").trim(), i = (pocketDraft.incidental || "").trim();
+                                    if (!l || !i)
+                                        return;
+                                    setPockets({ living: l, incidental: i });
+                                } }, "\uC9C0\uAC11 \uC774\uB984 \uBCC0\uACBD")),
+                        React.createElement("p", { className: "text-sm font-medium mb-1" }, "\uACB0\uC0B0 \uC2DC\uC791\uC77C"),
+                        React.createElement("p", { className: "text-xs mb-2 leading-relaxed", style: { color: C.muted } },
+                            "\uC0DD\uD65C\uBE44 \uC608\uC0B0\uC744 \uD55C \uBC14\uD034\uB85C \uC138\uB294 \uAE30\uC900\uC77C\uC785\uB2C8\uB2E4. \uCE74\uB4DC \uACB0\uC81C\uC77C\uC774\uB098 \uC6D4\uAE09\uB0A0\uC5D0 \uB9DE\uCD94\uBA74 \uD3B8\uD569\uB2C8\uB2E4.",
+                            " ",
+                            React.createElement("b", null, "1\uC77C"),
+                            "\uB85C \uB450\uBA74 \uB2EC\uB825 \uADF8\uB300\uB85C (1\uC77C ~ \uB9D0\uC77C) \uACC4\uC0B0\uD569\uB2C8\uB2E4."),
+                        React.createElement("div", { className: "flex gap-2 items-center mb-1.5" },
+                            React.createElement(SelectInput, { value: String(settleDraft), onChange: (e) => setSettleDraft(Number(e.target.value)), style: { flex: 1 } }, Array.from({ length: 28 }, (_, i) => i + 1).map((d) => (React.createElement("option", { key: d, value: d },
+                                "\uB9E4\uC6D4 ",
+                                d,
+                                "\uC77C \uC2DC\uC791")))),
+                            React.createElement(PrimaryBtn, { onClick: () => setSettleDay(normSettleDay(settleDraft)) }, "\uACB0\uC0B0\uC77C \uBCC0\uACBD")),
+                        React.createElement("p", { className: "text-xs mb-1.5", style: { color: C.inkSoft } },
+                            "\uC9C0\uAE08 \uC124\uC815: ",
+                            React.createElement("b", null, periodLabel(getCurrentPeriod(new Date(), settleDraft))),
+                            " \uC774 \uC774\uBC88 \uACB0\uC0B0\uC774 \uB429\uB2C8\uB2E4."),
+                        React.createElement("p", { className: "text-xs mb-5 leading-relaxed", style: { color: C.muted } },
+                            "\uBC30\uC6B0\uC790 \uD654\uBA74\uC5D0\uB3C4 \uB611\uAC19\uC774 \uC801\uC6A9\uB429\uB2C8\uB2E4. \uC774\uBBF8 \uC801\uC5B4\uB454 \uAC70\uB798\uB294 \uADF8\uB300\uB85C \uC788\uACE0, \uC5B4\uB290 \uACB0\uC0B0\uC5D0 \uB4E4\uC5B4\uAC00\uB294\uC9C0\uB9CC \uB2E4\uC2DC \uACC4\uC0B0\uB429\uB2C8\uB2E4.",
+                            normSettleDay(settleDraft) !== settleDay && React.createElement("span", { style: { color: C.accentDeep } },
+                                " \u00B7 \uC544\uC9C1 ",
+                                React.createElement("b", null, "\uACB0\uC0B0\uC77C \uBCC0\uACBD"),
+                                "\uC744 \uB204\uB974\uC9C0 \uC54A\uC558\uC5B4\uC694.")),
+                        React.createElement("p", { className: "text-xs mb-2", style: { color: C.muted } }, "\uC774 \uAE30\uAE30\uAC00 \uC5F0\uACB0\uB41C \uC800\uC7A5\uC18C \uC8FC\uC18C"),
+                        React.createElement("div", { className: "text-xs mb-3 p-2.5 rounded-lg", style: { background: "#FAF9F6", color: C.inkSoft, fontFamily: "monospace", wordBreak: "break-all", border: `1px solid ${C.border}` } }, cfg.apiUrl),
+                        React.createElement("button", { onClick: async () => { const ok = await copyText(pairCode); setPairCopied(ok); setTimeout(() => setPairCopied(false), 2000); }, className: "w-full py-2.5 rounded-lg text-sm font-medium mb-1.5", style: { background: pairCopied ? C.positiveSoft : C.ink, color: pairCopied ? C.positive : "#fff" } }, pairCopied ? "✓ 연결코드를 복사했어요" : "배우자에게 연결코드 보내기"),
+                        React.createElement("p", { className: "text-xs mb-3", style: { color: C.muted } }, "\uBCF5\uC0AC\uB41C \uCF54\uB4DC\uB97C \uBC30\uC6B0\uC790\uC5D0\uAC8C \uC804\uB2EC\uD558\uBA74, \uBC30\uC6B0\uC790 \uC571\uC758 \uCCAB \uD654\uBA74\uC5D0\uC11C \uBD99\uC5EC\uB123\uAE30\uB9CC\uC73C\uB85C \uAC19\uC740 \uAC00\uACC4\uBD80\uC5D0 \uC5F0\uACB0\uB429\uB2C8\uB2E4."),
+                        mobileLink(pairCode) && (React.createElement("div", { className: "rounded-xl p-3.5 mb-3", style: { background: "#FAF9F6", border: `1px solid ${C.border}` } },
+                            React.createElement("div", { className: "text-sm font-semibold mb-1", style: { color: C.ink } }, "\uD734\uB300\uD3F0\uC5D0\uC11C \uC4F0\uAE30"),
+                            React.createElement("p", { className: "text-xs mb-3", style: { color: C.muted } },
+                                "\uD734\uB300\uD3F0 \uCE74\uBA54\uB77C\uB85C \uC544\uB798 QR \uC744 \uCC0D\uC73C\uBA74 \uAC19\uC740 \uAC00\uACC4\uBD80\uAC00 \uBC14\uB85C \uC5F4\uB9BD\uB2C8\uB2E4. \uC124\uCE58 \uC5C6\uC774 \uC4F0\uACE0, \uBE0C\uB77C\uC6B0\uC800 \uBA54\uB274\uC758 ",
+                                React.createElement("b", null, "\uD648 \uD654\uBA74\uC5D0 \uCD94\uAC00"),
+                                " \uB97C \uB204\uB974\uBA74 \uC571\uCC98\uB7FC \uC544\uC774\uCF58\uC774 \uC0DD\uAE41\uB2C8\uB2E4."),
+                            React.createElement(QrCode, { text: mobileLink(pairCode), size: 190, caption: "\uCE74\uBA54\uB77C \uC571\uC73C\uB85C \uCC0D\uC73C\uC138\uC694" }),
+                            React.createElement("button", { onClick: async () => { const ok = await copyText(mobileLink(pairCode)); setMobileCopied(ok); setTimeout(() => setMobileCopied(false), 2000); }, className: "w-full py-2 rounded-lg text-sm font-medium mt-3", style: { background: mobileCopied ? C.positiveSoft : "#EFEAE0", color: mobileCopied ? C.positive : C.inkSoft } }, mobileCopied ? "✓ 주소를 복사했어요" : "휴대폰용 주소 복사 (카톡으로 보내기)"),
+                            React.createElement("p", { className: "text-xs mt-2", style: { color: C.negative } }, "\uC774 QR \uC5D0\uB294 \uB0B4 \uAC00\uACC4\uBD80 \uC5F4\uC1E0\uAC00 \uB4E4\uC5B4 \uC788\uC2B5\uB2C8\uB2E4. \uB2E4\uB978 \uC0AC\uB78C\uC5D0\uAC8C \uBCF4\uC5EC\uC8FC\uC9C0 \uB9C8\uC138\uC694."))),
+                        !resetMode ? (React.createElement("button", { onClick: () => { setResetMode("menu"); setResetMsg(null); }, className: "w-full py-2 rounded-lg text-sm font-medium", style: { background: "#EFEAE0", color: C.inkSoft } }, "\uCD08\uAE30\uD654 \u00B7 \uB2E4\uB978 \uC800\uC7A5\uC18C\uB85C \uB2E4\uC2DC \uC5F0\uACB0")) : (React.createElement("div", { className: "rounded-xl p-3.5", style: { background: "#FAF9F6", border: `1px solid ${C.border}` } },
+                            React.createElement("div", { className: "flex items-center justify-between mb-2" },
+                                React.createElement("div", { className: "text-sm font-semibold", style: { color: C.ink } }, "\uCD08\uAE30\uD654"),
+                                React.createElement("button", { onClick: () => { setResetMode(null); setResetMsg(null); }, className: "text-xs", style: { color: C.muted } }, "\uCDE8\uC18C")),
+                            React.createElement("button", { onClick: () => { if (window.confirm("이 PC 의 연결 정보와 AI 키를 지우고 처음 설정 화면으로 돌아갑니다.\n구글 시트의 가계부 내용은 그대로 남습니다."))
+                                    onChangeServer({ keepGeminiKey: false }); }, className: "w-full text-left px-3 py-2.5 rounded-lg mb-2", style: { background: C.surface, border: `1px solid ${C.border}` } },
+                                React.createElement("div", { className: "text-sm font-medium", style: { color: C.ink } }, "\uC774 PC \uB9CC \uCD08\uAE30\uD654"),
+                                React.createElement("div", { className: "text-xs mt-0.5", style: { color: C.muted } },
+                                    "\uC5F0\uACB0 \uC8FC\uC18C\u00B7AI \uD0A4\u00B7\uC774 PC \uC5D0 \uC800\uC7A5\uB41C \uC815\uBCF4\uB97C \uC9C0\uC6B0\uACE0 \uCC98\uC74C \uC124\uC815\uBD80\uD130 \uB2E4\uC2DC \uD569\uB2C8\uB2E4. ",
+                                    React.createElement("b", null, "\uAD6C\uAE00 \uC2DC\uD2B8 \uB0B4\uC6A9\uC740 \uB0A8\uC2B5\uB2C8\uB2E4."))),
+                            React.createElement("button", { onClick: async () => {
+                                    if (!window.confirm("구글 시트에 저장된 가계부 내용을 모두 지웁니다.\n거래내역·계좌·예적금·일정·AI 키가 전부 사라지며 되돌릴 수 없습니다.\n\n계속할까요?"))
+                                        return;
+                                    if (!window.confirm("정말 지웁니다. 배우자 화면에서도 사라집니다.\n필요하면 먼저 [백업 파일로 내보내기] 를 해두세요.\n\n마지막 확인입니다."))
+                                        return;
+                                    setResetBusy(true);
+                                    setResetMsg({ ok: true, text: "지우는 중입니다. 최대 1분 정도 걸릴 수 있어요." });
+                                    pendingSaves.current += 1; // 지우는 동안 자동 동기화를 멈춘다
+                                    try {
+                                        const r = await remoteClearAll(cfg, (i, n) => setResetMsg({ ok: true, text: `지우는 중... (${i}/${n})` }));
+                                        setResetMsg({ ok: true, text: (r.mode === "slow" ? "예전 버전 저장소라 하나씩 지웠습니다. " : "") + "완료되었습니다. 잠시 후 처음 설정 화면으로 돌아갑니다." });
+                                        setTimeout(() => onChangeServer({ keepGeminiKey: false }), 1400);
+                                    }
+                                    catch (e) {
+                                        const msg = String((e && e.message) || "네트워크를 확인해주세요");
+                                        setResetMsg({ ok: false, text: "삭제 실패 — " + msg + (/시간이 초과|LOCK_TIMEOUT/.test(msg) ? " · 구글 시트에서 KV 시트 탭을 직접 삭제해도 같은 효과입니다." : "") });
+                                    }
+                                    finally {
+                                        pendingSaves.current = Math.max(0, pendingSaves.current - 1);
+                                        setResetBusy(false);
+                                    }
+                                }, disabled: resetBusy, className: "w-full text-left px-3 py-2.5 rounded-lg", style: { background: C.negativeSoft, border: `1px solid ${C.negative}`, opacity: resetBusy ? 0.6 : 1 } },
+                                React.createElement("div", { className: "text-sm font-medium", style: { color: C.negative } }, resetBusy ? "지우는 중..." : "구글 시트 데이터까지 전부 삭제"),
+                                React.createElement("div", { className: "text-xs mt-0.5", style: { color: C.negative } }, "\uAC00\uACC4\uBD80 \uB0B4\uC6A9\u00B7AI \uD0A4\u00B7\uC5F0\uACB0 \uC815\uBCF4\uAC00 \uBAA8\uB450 \uC0AC\uB77C\uC9D1\uB2C8\uB2E4. \uB418\uB3CC\uB9B4 \uC218 \uC5C6\uACE0 \uBC30\uC6B0\uC790 \uD654\uBA74\uC5D0\uC11C\uB3C4 \uC0AC\uB77C\uC9D1\uB2C8\uB2E4.")),
+                            resetMsg && React.createElement("div", { className: "text-xs mt-2", style: { color: resetMsg.ok ? C.positive : C.negative } }, resetMsg.text))),
+                        React.createElement("div", { className: "mt-5 pt-4", style: { borderTop: `1px dashed ${C.border}` } },
+                            React.createElement("p", { className: "text-sm font-medium mb-1" }, "Gemini API \uD0A4 (\uC601\uC218\uC99D \uC790\uB3D9\uC778\uC2DD\uC6A9)"),
+                            React.createElement("p", { className: "text-xs mb-2 leading-relaxed", style: { color: C.muted } }, "\uC601\uC218\uC99D\u00B7\uCE74\uB4DC\uB0B4\uC5ED \uC774\uBBF8\uC9C0\uB294 \uC774 PC \uC5D0\uC11C \uAD6C\uAE00 Gemini \uB85C \uC9C1\uC811 \uC804\uC1A1\uB429\uB2C8\uB2E4. \uAC1C\uC778\uC6A9 \uBB34\uB8CC \uC0AC\uC6A9\uB7C9 \uC548\uC5D0\uC11C \uB300\uAC1C \uC694\uAE08\uC774 \uBC1C\uC0DD\uD558\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4. \uD0A4\uB97C \uB123\uC9C0 \uC54A\uC544\uB3C4 \uC9C1\uC811 \uC785\uB825\uC73C\uB85C \uAC00\uACC4\uBD80\uB97C \uC4F8 \uC218 \uC788\uC5B4\uC694."),
+                            React.createElement("div", { className: "flex gap-2" },
+                                React.createElement(TextInput, { type: "password", value: geminiKeyDraft, onChange: (e) => setGeminiKeyDraft(e.target.value), placeholder: "AIzaSy..." }),
+                                React.createElement(PrimaryBtn, { onClick: () => { const k = geminiKeyDraft.trim(); onSaveGeminiKey(k); setSharedGemini(k); } }, "\uC800\uC7A5")),
+                            React.createElement("p", { className: "text-xs mt-1.5", style: { color: C.positive } }, "\uC800\uC7A5\uD558\uBA74 \uBC30\uC6B0\uC790 \uAE30\uAE30\uC5D0\uB3C4 \uC790\uB3D9\uC73C\uB85C \uC801\uC6A9\uB429\uB2C8\uB2E4. \uBC30\uC6B0\uC790\uAC00 \uB530\uB85C \uBC1C\uAE09\uBC1B\uC744 \uD544\uC694\uAC00 \uC5C6\uC5B4\uC694."),
+                            sharedGemini && (React.createElement("button", { onClick: () => { setSharedGemini(""); }, className: "text-xs mt-1", style: { color: C.muted, textDecoration: "underline" } }, "\uACF5\uC720 \uD574\uC81C (\uB0B4 \uAE30\uAE30\uC5D0\uC11C\uB9CC \uC0AC\uC6A9)")),
+                            React.createElement("button", { onClick: () => { setShowSettings(false); setShowGemini(true); }, className: "w-full py-2 rounded-lg text-sm font-medium mt-2", style: { background: C.accentSoft, color: C.accentDeep } }, "\uD0A4 \uBC1B\uB294 \uBC95 \uC790\uC138\uD788 \uBCF4\uAE30 (\uADF8\uB9BC \uC124\uBA85)"),
+                            cfg.geminiKey && React.createElement("div", { className: "text-xs mt-2", style: { color: C.positive } }, "\u2713 \uD0A4\uAC00 \uC800\uC7A5\uB418\uC5B4 \uC788\uC5B4\uC694")),
+                        React.createElement("div", { className: "mt-5 pt-4", style: { borderTop: `1px dashed ${C.border}` } },
+                            React.createElement("p", { className: "text-sm font-medium mb-1" }, "\uBC31\uC5C5 / \uBCF5\uC6D0"),
+                            React.createElement("p", { className: "text-xs mb-2 leading-relaxed", style: { color: C.muted } }, "\uC804\uCCB4 \uAC00\uACC4\uBD80\uB97C \uD30C\uC77C \uD558\uB098\uB85C \uC800\uC7A5\uD574 \uB458 \uC218 \uC788\uC5B4\uC694. \uC800\uC7A5\uC18C\uB97C \uC62E\uAE30\uAC70\uB098 \uC2E4\uC218\uB85C \uC9C0\uC6E0\uC744 \uB54C \uADF8\uB300\uB85C \uB418\uB3CC\uB9BD\uB2C8\uB2E4."),
+                            React.createElement("div", { className: "flex gap-2" },
+                                React.createElement("button", { onClick: doExport, className: "flex-1 py-2 rounded-lg text-sm font-medium", style: { background: "#EFEAE0", color: C.inkSoft } }, "\uBC31\uC5C5 \uD30C\uC77C\uB85C \uB0B4\uBCF4\uB0B4\uAE30"),
+                                React.createElement("button", { onClick: doImport, className: "flex-1 py-2 rounded-lg text-sm font-medium", style: { background: "#EFEAE0", color: C.inkSoft } }, "\uBC31\uC5C5 \uD30C\uC77C\uC5D0\uC11C \uBCF5\uC6D0")),
+                            ioMsg && React.createElement("div", { className: "text-xs mt-2", style: { color: ioMsg.ok ? C.positive : C.negative } }, ioMsg.text),
+                            React.createElement("p", { className: "text-xs mt-2", style: { color: C.muted } }, "\uBCF5\uC6D0\uD558\uBA74 \uD604\uC7AC \uAC00\uACC4\uBD80 \uB0B4\uC6A9\uC744 \uBC31\uC5C5 \uD30C\uC77C \uB0B4\uC6A9\uC73C\uB85C \uB36E\uC5B4\uC501\uB2C8\uB2E4.")),
+                        React.createElement("div", { className: "mt-5 pt-4", style: { borderTop: `1px dashed ${C.border}` } },
+                            React.createElement("button", { onClick: () => { setShowSettings(false); setShowHelp(true); }, className: "w-full py-2 rounded-lg text-sm font-medium", style: { background: "#EFEAE0", color: C.inkSoft } }, "\uC0AC\uC6A9 \uC548\uB0B4 \uB2E4\uC2DC \uBCF4\uAE30"))))),
+                showHelp && React.createElement(HelpModal, { onClose: () => setShowHelp(false), onGoTab: (id) => setTab(id) }),
+                showGemini && React.createElement(GeminiGuideModal, { onClose: () => setShowGemini(false), currentKey: cfg.geminiKey, onSave: (k) => { onSaveGeminiKey(k); setGeminiKeyDraft(k); setSharedGemini(k); } }),
+                showUpdate && React.createElement(StorageUpdateModal, { cfg: cfg, onClose: () => setShowUpdate(false), onRecheck: () => { setStorageOld(false); reloadAll(true); } })))));
 }
 // ---------- 대시보드 ----------
 function Dashboard({ transactions, savings, events, todos, budgets, totalSavingsCurrent }) {
     const pn = usePocketNames();
-    const period = useMemo(() => getCurrentPeriod(), []);
-    const prevPeriod = useMemo(() => shiftPeriod(period, -1), [period]);
+    const settleDay = useSettleDay();
+    const period = useMemo(() => getCurrentPeriod(new Date(), settleDay), [settleDay]);
+    const prevPeriod = useMemo(() => shiftPeriod(period, -1, settleDay), [period, settleDay]);
     const periodTx = useMemo(() => txInPeriod(transactions, period), [transactions, period]);
     const prevTx = useMemo(() => txInPeriod(transactions, prevPeriod), [transactions, prevPeriod]);
     const prevIncome = prevTx.filter((t) => t.type === "income").reduce((s, t) => s + Number(t.amount), 0);
@@ -2950,7 +3010,10 @@ function BatchReviewModal({ items, onConfirm, onClose }) {
 // ---------- 생활비관리 ----------
 function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTransaction, updateTransaction, cfg, onOpenSettings, budgets, setBudgetForPeriod }) {
     const pn = usePocketNames();
-    const [period, setPeriod] = useState(() => getCurrentPeriod());
+    const settleDay = useSettleDay();
+    const [period, setPeriod] = useState(() => getCurrentPeriod(new Date(), settleDay));
+    // 설정에서 결산 시작일을 바꾸면 지금 보고 있는 기간도 새 기준으로 다시 잡는다.
+    useEffect(() => { setPeriod(getCurrentPeriod(new Date(), settleDay)); }, [settleDay]);
     const [showBudgetModal, setShowBudgetModal] = useState(false);
     const empty = { date: todayStr(), type: "expense", pocket: "living", category: EXPENSE_CATS[0], amount: "", memo: "", owner: "" };
     const [form, setForm] = useState(empty);
@@ -3086,12 +3149,12 @@ function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTran
         React.createElement(Card, { lift: true, style: { borderColor: remaining < 0 ? C.negative : C.border } },
             React.createElement("div", { className: "flex items-center justify-between mb-3 flex-wrap gap-2" },
                 React.createElement("div", { className: "flex items-center gap-2" },
-                    React.createElement(IconBtn, { onClick: () => setPeriod(shiftPeriod(period, -1)), title: "\uC774\uC804 \uACB0\uC0B0" },
+                    React.createElement(IconBtn, { onClick: () => setPeriod(shiftPeriod(period, -1, settleDay)), title: "\uC774\uC804 \uACB0\uC0B0" },
                         React.createElement(IconChevronLeft, { size: 16 })),
                     React.createElement("div", { className: "text-sm md:text-base font-medium", style: { fontFamily: SERIF } },
                         periodLabel(period),
                         " \uACB0\uC0B0"),
-                    React.createElement(IconBtn, { onClick: () => setPeriod(shiftPeriod(period, 1)), title: "\uB2E4\uC74C \uACB0\uC0B0" },
+                    React.createElement(IconBtn, { onClick: () => setPeriod(shiftPeriod(period, 1, settleDay)), title: "\uB2E4\uC74C \uACB0\uC0B0" },
                         React.createElement(IconChevronRight, { size: 16 }))),
                 React.createElement("button", { onClick: () => setShowBudgetModal(true), className: "inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium", style: { background: C.accentSoft, color: C.accentDeep } },
                     React.createElement(IconSettings, { size: 13 }),
