@@ -14,6 +14,7 @@ const GEMINI_MODEL = "gemini-3.6-flash";
 // 휴대폰용 웹 주소. 빌드할 때 app.config.json 의 mobileWebUrl 값이 여기에 들어간다.
 // (소스를 직접 고칠 필요 없이 app.config.json 만 수정하면 된다.)
 const MOBILE_WEB_URL = "https://elezelise77.github.io/budget/";
+const APP_VERSION = "1.1.0"; // 빌드할 때 package.json 의 version 이 들어간다
 function mobileLink(pairCode) {
     if (!MOBILE_WEB_URL)
         return "";
@@ -2398,6 +2399,9 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
                                     "\uAC1C \uBD88\uB7EC\uC624\uB294 \uC911..."))),
                             React.createElement("p", { className: "text-xs", style: { color: C.muted } }, "\uC9C0\uAE08 \uAC00\uACC4\uBD80\uC5D0 \uB4E4\uC5B4 \uC788\uB294 \uB0B4\uC6A9\uC740 \uB36E\uC5B4\uC368\uC9D1\uB2C8\uB2E4. \uAC71\uC815\uB418\uBA74 \uC704\uC5D0\uC11C \uBC31\uC5C5\uC744 \uBA3C\uC800 \uBC1B\uC544\uB450\uC138\uC694."))),
                         React.createElement("div", { className: "mt-5 pt-4", style: { borderTop: `1px dashed ${C.border}` } },
+                            React.createElement("p", { className: "text-xs text-center mb-3", style: { color: C.muted } },
+                                "\uC6B0\uB9AC\uC9D1 \uAC00\uACC4\uBD80 v",
+                                APP_VERSION),
                             React.createElement("button", { onClick: () => { setShowSettings(false); setShowHelp(true); }, className: "w-full py-2 rounded-lg text-sm font-medium", style: { background: "#EFEAE0", color: C.inkSoft } }, "\uC0AC\uC6A9 \uC548\uB0B4 \uB2E4\uC2DC \uBCF4\uAE30"))))),
                 showHelp && React.createElement(HelpModal, { onClose: () => setShowHelp(false), onGoTab: (id) => setTab(id) }),
                 showGemini && React.createElement(GeminiGuideModal, { onClose: () => setShowGemini(false), currentKey: cfg.geminiKey, onSave: (k) => { onSaveGeminiKey(k); setGeminiKeyDraft(k); setSharedGemini(k); } }),
