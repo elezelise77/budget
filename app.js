@@ -14,7 +14,7 @@ const GEMINI_MODEL = "gemini-3.6-flash";
 // 휴대폰용 웹 주소. 빌드할 때 app.config.json 의 mobileWebUrl 값이 여기에 들어간다.
 // (소스를 직접 고칠 필요 없이 app.config.json 만 수정하면 된다.)
 const MOBILE_WEB_URL = "https://elezelise77.github.io/budget/";
-const APP_VERSION = "1.2.0"; // 빌드할 때 package.json 의 version 이 들어간다
+const APP_VERSION = "1.3.0"; // 빌드할 때 package.json 의 version 이 들어간다
 function mobileLink(pairCode) {
     if (!MOBILE_WEB_URL)
         return "";
@@ -181,6 +181,14 @@ function txPocket(t) {
 //   예산 막대   = 쓴 돈 / 예산 그대로. "예산은 예산" 이라 이월·입금으로 기준선을 늘리지 않는다.
 // 급여는 예산의 출처라서 채워 넣은 돈에 넣지 않는다. 더하면 이중 계산이 된다.
 function isPocketTopUp(t) { return t.type === "income" && t.category !== "급여"; }
+function isSalary(t) { return t.type === "income" && t.category === "급여"; }
+// 급여는 결산이 시작되기 "전"에 들어와서 그 결산을 굴리는 돈이다.
+// 예) 9/10 이나 9/15 에 받은 급여는 8/16~9/15 결산이 아니라 9/16~10/15 결산의 급여다.
+// 그래서 지급일이 속한 결산의 '다음' 결산 것으로 잡는다.
+function salaryForPeriod(transactions, period) {
+    const prev = shiftPeriod(period, -1, period.start.getDate());
+    return txInPeriod(transactions, prev).filter(isSalary);
+}
 // 이월은 앞 결산 결과에 의존하므로, 기록이 있는 가장 오래된 결산부터 차례로 쌓아 올린다.
 const MAX_CARRY_PERIODS = 400; // 무한 루프 방지 (약 33년치)
 function firstRecordedDate(transactions, budgets) {
@@ -773,13 +781,13 @@ function DateInput({ value, onChange, style }) {
         onChange(`${ny}-${String(nm).padStart(2, "0")}-${String(dd).padStart(2, "0")}`);
     };
     return (React.createElement("div", { className: "flex gap-1 w-full", style: style },
-        React.createElement(SelectInput, { value: y, onChange: (e) => update(e.target.value, m || "1", d || "1"), style: { flex: "1.9", minWidth: 0, paddingLeft: 6, paddingRight: 2 } },
+        React.createElement(SelectInput, { value: y, onChange: (e) => update(e.target.value, m || "1", d || "1"), style: { flex: "1.6", minWidth: 78, paddingLeft: 8, paddingRight: 2 } },
             React.createElement("option", { value: "" }, "\uB144"),
             years.map((yy) => React.createElement("option", { key: yy, value: yy }, yy))),
-        React.createElement(SelectInput, { value: m, onChange: (e) => update(y || String(thisYear), e.target.value, d || "1"), style: { flex: 1, minWidth: 0, paddingLeft: 6, paddingRight: 2 } },
+        React.createElement(SelectInput, { value: m, onChange: (e) => update(y || String(thisYear), e.target.value, d || "1"), style: { flex: 1, minWidth: 60, paddingLeft: 8, paddingRight: 2 } },
             React.createElement("option", { value: "" }, "\uC6D4"),
             Array.from({ length: 12 }, (_, i) => i + 1).map((mm) => React.createElement("option", { key: mm, value: mm }, mm))),
-        React.createElement(SelectInput, { value: d, onChange: (e) => update(y || String(thisYear), m || "1", e.target.value), style: { flex: 1, minWidth: 0, paddingLeft: 6, paddingRight: 2 } },
+        React.createElement(SelectInput, { value: d, onChange: (e) => update(y || String(thisYear), m || "1", e.target.value), style: { flex: 1, minWidth: 60, paddingLeft: 8, paddingRight: 2 } },
             React.createElement("option", { value: "" }, "\uC77C"),
             days.map((dd) => React.createElement("option", { key: dd, value: dd }, dd)))));
 }
@@ -2500,16 +2508,14 @@ function Dashboard({ transactions, savings, events, todos, budgets, totalSavings
     const pb = useMemo(() => computePocketBalances(transactions, budgets, period), [transactions, budgets, period]);
     const { budgetObj, livingExpense: livingExpenseOnly, incidentalExpense, livingTopUp, incidentalTopUp, livingCarry, incidentalCarry, livingOver, incidentalOver, livingBalance, incidentalBalance, liquidFunds } = pb;
     const totalAssets = totalSavingsCurrent + liquidFunds;
-    const now = new Date();
-    const thisMonthNum = now.getMonth() + 1;
-    const thisMonthPrefix = `${now.getFullYear()}-${String(thisMonthNum).padStart(2, "0")}`;
-    const salaryTxThisMonth = useMemo(() => transactions.filter((t) => t.type === "income" && t.category === "급여" && t.date && t.date.startsWith(thisMonthPrefix)), [transactions, thisMonthPrefix]);
-    const salaryTotal = salaryTxThisMonth.reduce((s, t) => s + Number(t.amount), 0);
+    // 급여는 결산 시작 전에 들어오므로 직전 결산 기간에 받은 것을 이번 결산 급여로 본다.
+    const salaryTx = useMemo(() => salaryForPeriod(transactions, period), [transactions, period]);
+    const salaryTotal = salaryTx.reduce((s, t) => s + Number(t.amount), 0);
     const salaryByOwner = useMemo(() => {
         const map = {};
-        salaryTxThisMonth.forEach((t) => { const o = t.owner && t.owner.trim() ? t.owner.trim() : "미지정"; map[o] = (map[o] || 0) + Number(t.amount); });
+        salaryTx.forEach((t) => { const o = t.owner && t.owner.trim() ? t.owner.trim() : "미지정"; map[o] = (map[o] || 0) + Number(t.amount); });
         return Object.entries(map).sort((a, b) => b[1] - a[1]);
-    }, [salaryTxThisMonth]);
+    }, [salaryTx]);
     const catTotals = {};
     periodTx.filter((t) => t.type === "expense").forEach((t) => { catTotals[t.category] = (catTotals[t.category] || 0) + Number(t.amount); });
     const topCats = Object.entries(catTotals).sort((a, b) => b[1] - a[1]).slice(0, 5);
@@ -2517,7 +2523,7 @@ function Dashboard({ transactions, savings, events, todos, budgets, totalSavings
     const upcoming = useMemo(() => upcomingItems(events, KR_HOLIDAYS, new Date(), 60, 5), [events]);
     const incompleteTodos = todos.filter((t) => !t.done);
     const todoDone = todos.filter((t) => t.done).length;
-    const daysToSettlement = daysBetween(now, period.end);
+    const daysToSettlement = daysBetween(new Date(), period.end);
     const settlementLabel = daysToSettlement <= 0 ? "결산일이에요" : `다음 결산까지 D-${daysToSettlement}`;
     return (React.createElement("div", { className: "flex flex-col gap-5 md:gap-6" },
         React.createElement("div", { className: "rounded-2xl p-6 md:p-10 relative overflow-hidden fade-in-up", style: { background: `linear-gradient(135deg, ${C.ink} 0%, #24262F 60%, ${C.ink} 100%)`, color: "#fff", boxShadow: C.shadowLift } },
@@ -2560,16 +2566,15 @@ function Dashboard({ transactions, savings, events, todos, budgets, totalSavings
                     React.createElement(AnimatedNumber, { value: incidentalBalance })),
                 React.createElement(BudgetLine, { small: true, spent: incidentalExpense, budget: budgetObj.incidental, carry: incidentalCarry, topUp: incidentalTopUp, over: incidentalOver })),
             React.createElement(Card, { lift: true },
-                React.createElement("div", { className: "text-xs md:text-sm", style: { color: C.muted } },
-                    "\uC774\uBC88\uB2EC \uAE09\uC5EC(",
-                    thisMonthNum,
-                    "\uC6D4)"),
+                React.createElement("div", { className: "text-xs md:text-sm", style: { color: C.muted } }, "\uC774\uBC88 \uACB0\uC0B0 \uAE09\uC5EC"),
                 React.createElement("div", { className: "text-xl md:text-2xl font-semibold mt-1", style: { fontFamily: SERIF, color: C.positive } },
                     React.createElement(AnimatedNumber, { value: salaryTotal })),
                 salaryByOwner.length > 0 ? (React.createElement("div", { className: "flex flex-wrap gap-1.5 mt-2.5" }, salaryByOwner.map(([owner, amt]) => (React.createElement("div", { key: owner, className: "text-[11px] px-2 py-0.5 rounded-full", style: { background: C.positiveSoft, color: C.positive } },
                     owner,
                     " ",
-                    formatWon(amt)))))) : (React.createElement("div", { className: "text-[11px] mt-2.5", style: { color: C.muted } }, "\uC0DD\uD65C\uBE44\uAD00\uB9AC\uC5D0\uC11C \uAD6C\uBD84=\uC218\uC785, \uCE74\uD14C\uACE0\uB9AC=\uAE09\uC5EC\uB85C \uB4F1\uB85D\uD574\uBCF4\uC138\uC694."))),
+                    formatWon(amt)))))) : (React.createElement("div", { className: "text-[11px] mt-2.5", style: { color: C.muted } },
+                    periodLabel(shiftPeriod(period, -1, period.start.getDate())),
+                    " \uC5D0 \uB4E4\uC5B4\uC628 \uAE09\uC5EC\uAC00 \uC5EC\uAE30 \uC7A1\uD799\uB2C8\uB2E4. \uC0DD\uD65C\uBE44\uAD00\uB9AC \u2192 \uC608\uC0B0\uAD00\uB9AC\uC5D0\uC11C \uB4F1\uB85D\uD558\uC138\uC694."))),
             React.createElement(Card, { lift: true },
                 React.createElement("div", { className: "text-xs md:text-sm", style: { color: C.muted } }, "\uD560\uC77C \uC9C4\uD589\uB960"),
                 React.createElement("div", { className: "text-xl md:text-2xl font-semibold mt-1", style: { fontFamily: SERIF } }, todos.length ? `${todoDone}/${todos.length}` : "-"),
@@ -3048,13 +3053,25 @@ function BudgetManageModal({ period, budgetObj, onSaveBudget, periodIncomeTx, ad
     const [total, setTotal] = useState(String(budgetObj.total || ""));
     const pn = usePocketNames();
     const [incidental, setIncidental] = useState(String(budgetObj.incidental || ""));
-    const [incForm, setIncForm] = useState({ date: todayStr(), amount: "", category: INCOME_CATS[0], owner: "", memo: "" });
+    // 이 결산에 잡히도록 날짜 기본값을 맞춰 준다.
+    //  - 급여: 결산 시작 하루 전 (급여는 결산이 시작되기 전에 들어와 이 결산을 굴리는 돈이므로)
+    //  - 그 외: 오늘. 다른 결산을 보고 있어서 오늘이 그 기간 밖이면 결산 마지막 날로.
+    const defaultIncomeDate = (category) => {
+        if (category === "급여") {
+            const d = new Date(period.start);
+            d.setDate(d.getDate() - 1);
+            return toDateStr(d);
+        }
+        const today = todayStr();
+        return today >= toDateStr(period.start) && today <= toDateStr(period.end) ? today : toDateStr(period.end);
+    };
+    const [incForm, setIncForm] = useState(() => ({ date: defaultIncomeDate(INCOME_CATS[0]), amount: "", category: INCOME_CATS[0], owner: "", memo: "" }));
     const addIncome = (e) => {
         e.preventDefault();
         if (!incForm.amount)
             return;
         addTransaction({ ...incForm, owner: (incForm.owner || "").trim(), type: "income", pocket: "living", amount: Number(incForm.amount) });
-        setIncForm({ date: todayStr(), amount: "", category: INCOME_CATS[0], owner: incForm.owner, memo: "" });
+        setIncForm({ date: defaultIncomeDate(incForm.category), amount: "", category: incForm.category, owner: incForm.owner, memo: "" });
     };
     return (React.createElement("div", { className: "fixed inset-0 flex items-center justify-center p-4 z-20", style: { background: "rgba(24,26,32,0.5)" } },
         React.createElement(Card, { style: { maxWidth: 560, maxHeight: "88vh", overflowY: "auto" }, className: "w-full relative fade-in-up" },
@@ -3082,14 +3099,24 @@ function BudgetManageModal({ period, budgetObj, onSaveBudget, periodIncomeTx, ad
                 React.createElement("b", null, "\uC911\uAC04\uC5D0 \uB3C8\uC744 \uB354 \uB123\uC5C8\uB2E4\uBA74"),
                 " \uC544\uB798\uC5D0\uC11C ",
                 React.createElement("b", null, "\uAE09\uC5EC \uC678 \uCE74\uD14C\uACE0\uB9AC"),
-                "(\uBD80\uC218\uC785 \u00B7 \uD658\uAE09/\uAE30\uD0C0 \uB4F1)\uB85C \uB4F1\uB85D\uD558\uC138\uC694. \uADF8\uB9CC\uD07C \uC794\uACE0\uC5D0 \uB354\uD574\uC9C0\uACE0, \uC608\uC0B0 \uB9C9\uB300\uB294 \uCD08\uACFC\uB41C \uADF8\uB300\uB85C \uBCF4\uC5EC\uC90D\uB2C8\uB2E4. \uAE09\uC5EC\uB294 \uC608\uC0B0\uC758 \uCD9C\uCC98\uB77C\uC11C \uC794\uACE0\uC5D0 \uB2E4\uC2DC \uB354\uD558\uC9C0 \uC54A\uC544\uC694."),
+                "(\uBD80\uC218\uC785 \u00B7 \uD658\uAE09/\uAE30\uD0C0 \uB4F1)\uB85C \uB4F1\uB85D\uD558\uC138\uC694. \uADF8\uB9CC\uD07C \uC794\uACE0\uC5D0 \uB354\uD574\uC9D1\uB2C8\uB2E4."),
+            React.createElement("p", { className: "text-xs mt-1 leading-relaxed", style: { color: C.muted } },
+                React.createElement("b", null, "\uAE09\uC5EC"),
+                "\uB294 \uB204\uAD6C \uB3C8\uC778\uC9C0 \uAE30\uB85D\uB9CC \uD558\uACE0 ",
+                React.createElement("b", null, "\uC794\uACE0\uC5D0\uB294 \uB354\uD558\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4."),
+                " \uC774 \uB3C8\uC5D0\uC11C \uC608\uC801\uAE08\u00B7\uACE0\uC815\uC9C0\uCD9C\u00B7\uC0DD\uD65C\uBE44 \uC608\uC0B0\uC774 \uB098\uB258\uC5B4 \uB098\uAC00\uBBC0\uB85C, \uC794\uACE0\uC5D0 \uB610 \uB354\uD558\uBA74 \uC774\uC911 \uACC4\uC0B0\uC774 \uB429\uB2C8\uB2E4."),
             React.createElement("div", { className: "mt-5 pt-4", style: { borderTop: `1px dashed ${C.border}` } },
                 React.createElement("div", { className: "text-sm font-medium mb-2" }, "\uC774\uBC88 \uACB0\uC0B0 \uC218\uC785 \uAD00\uB9AC"),
                 React.createElement("form", { onSubmit: addIncome, className: "grid grid-cols-2 gap-2 mb-3" },
                     React.createElement(DateInput, { value: incForm.date, onChange: (v) => setIncForm({ ...incForm, date: v }) }),
                     React.createElement(MoneyInput, { value: incForm.amount, onChange: (v) => setIncForm({ ...incForm, amount: v }), placeholder: "\uAE08\uC561" }),
-                    React.createElement(SelectInput, { value: incForm.category, onChange: (e) => setIncForm({ ...incForm, category: e.target.value }) }, INCOME_CATS.map((c) => React.createElement("option", { key: c }, c))),
-                    React.createElement(TextInput, { value: incForm.owner, onChange: (e) => setIncForm({ ...incForm, owner: e.target.value }), placeholder: "\uBC1B\uB294 \uC0AC\uB78C (\uC608: \uB0A8\uD3B8)" }),
+                    React.createElement(SelectInput, { value: incForm.category, onChange: (e) => {
+                            const c = e.target.value;
+                            // 날짜를 아직 손대지 않았으면 새 카테고리에 맞는 기본 날짜로 바꿔 준다.
+                            const untouched = incForm.date === defaultIncomeDate(incForm.category);
+                            setIncForm({ ...incForm, category: c, date: untouched ? defaultIncomeDate(c) : incForm.date });
+                        } }, INCOME_CATS.map((c) => React.createElement("option", { key: c }, c))),
+                    React.createElement(TextInput, { value: incForm.owner, onChange: (e) => setIncForm({ ...incForm, owner: e.target.value }), placeholder: "\uB204\uAD6C \uB3C8\uC778\uC9C0 (\uC608: \uB0A8\uD3B8)" }),
                     React.createElement(TextInput, { value: incForm.memo, onChange: (e) => setIncForm({ ...incForm, memo: e.target.value }), placeholder: "\uBA54\uBAA8(\uC120\uD0DD)" }),
                     React.createElement("div", null),
                     React.createElement("div", { className: "col-span-2 flex justify-end" },
@@ -3099,6 +3126,7 @@ function BudgetManageModal({ period, budgetObj, onSaveBudget, periodIncomeTx, ad
                 periodIncomeTx.length === 0 ? React.createElement("div", { className: "text-xs", style: { color: C.muted } }, "\uB4F1\uB85D\uB41C \uC218\uC785\uC774 \uC5C6\uC5B4\uC694.") : (React.createElement("div", { className: "flex flex-col gap-1.5" }, periodIncomeTx.map((t) => (React.createElement("div", { key: t.id, className: "flex items-center justify-between text-sm py-1.5", style: { borderBottom: `1px solid ${C.border}` } },
                     React.createElement("div", { className: "flex items-center gap-2 min-w-0" },
                         React.createElement("span", { className: "text-xs shrink-0", style: { color: C.muted } }, t.date?.slice(5)),
+                        React.createElement("span", { className: "text-[10px] px-1.5 py-0.5 rounded-md shrink-0 font-medium", style: isSalary(t) ? { background: "#EFEAE0", color: C.muted } : { background: C.positiveSoft, color: C.positive } }, isSalary(t) ? "기록만" : "+잔고"),
                         React.createElement("span", { className: "truncate" },
                             t.category,
                             t.owner ? ` · ${t.owner}` : "",
@@ -3113,6 +3141,7 @@ function BudgetManageModal({ period, budgetObj, onSaveBudget, periodIncomeTx, ad
 }
 // ---------- 카드 내역 일괄 검토 모달 ----------
 function BatchReviewModal({ items, onConfirm, onClose }) {
+    const pn = usePocketNames();
     const [rows, setRows] = useState(items.map((it) => {
         const type = it.type === "income" ? "income" : "expense";
         const cats = type === "income" ? INCOME_CATS : EXPENSE_CATS;
@@ -3165,7 +3194,7 @@ function BatchReviewModal({ items, onConfirm, onClose }) {
                 React.createElement("button", { onClick: () => toggleAll(false), className: "text-xs", style: { color: C.muted } }, "\uC804\uCCB4 \uD574\uC81C")),
             React.createElement("div", { className: "flex flex-col gap-2" }, rows.map((r) => (React.createElement("div", { key: r.id, className: "flex items-center gap-2 p-2 rounded-lg flex-wrap", style: { background: r.include ? (r.type === "income" ? C.positiveSoft : "#FAF9F6") : "transparent", opacity: r.include ? 1 : 0.45, border: `1px solid ${r.type === "income" && r.include ? C.positive : C.border}` } },
                 React.createElement("input", { type: "checkbox", checked: r.include, onChange: (e) => updateRow(r.id, { include: e.target.checked }) }),
-                React.createElement("div", { style: { width: 150 } },
+                React.createElement("div", { style: { width: 215 } },
                     React.createElement(DateInput, { value: r.date, onChange: (v) => updateRow(r.id, { date: v }) })),
                 React.createElement(SelectInput, { value: r.type, onChange: (e) => updateRow(r.id, { type: e.target.value }), style: { width: 78, color: r.type === "income" ? C.positive : C.negative, fontWeight: 600 } },
                     React.createElement("option", { value: "expense" }, "\uC9C0\uCD9C"),
@@ -3303,8 +3332,10 @@ function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTran
         setOcrSuccess(false);
     };
     const periodTx = useMemo(() => txInPeriod(transactions, period).sort((a, b) => b.date.localeCompare(a.date)), [transactions, period]);
-    const periodIncomeTx = useMemo(() => periodTx.filter((t) => t.type === "income"), [periodTx]);
-    const periodSalaryTx = useMemo(() => periodTx.filter((t) => t.type === "income" && t.category === "급여"), [periodTx]);
+    // 급여는 직전 결산에 들어온 것이 이번 결산의 급여다. 지갑을 채운 돈(급여 외 수입)은 날짜 그대로.
+    const periodSalaryTx = useMemo(() => salaryForPeriod(transactions, period), [transactions, period]);
+    const periodTopUpTx = useMemo(() => periodTx.filter(isPocketTopUp), [periodTx]);
+    const periodIncomeTx = useMemo(() => [...periodSalaryTx, ...periodTopUpTx].sort((a, b) => b.date.localeCompare(a.date)), [periodSalaryTx, periodTopUpTx]);
     const income = periodIncomeTx.reduce((s, t) => s + Number(t.amount), 0);
     const expense = periodTx.filter((t) => t.type === "expense").reduce((s, t) => s + Number(t.amount), 0);
     const pb = useMemo(() => computePocketBalances(transactions, budgets, period), [transactions, budgets, period]);
@@ -3347,6 +3378,12 @@ function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTran
                     budgetObj.incidental === 0 && incidentalCarry === 0 && incidentalTopUp === 0 && React.createElement("div", { className: "text-xs mt-2", style: { color: C.muted } }, "\uC608\uC0B0\uC774 \uC124\uC815\uB418\uC9C0 \uC54A\uC558\uC5B4\uC694.")))),
         periodSalaryTx.length > 0 && (React.createElement(Card, null,
             React.createElement(SectionTitle, null, "\uC774\uBC88 \uACB0\uC0B0 \uAE09\uC5EC \uB0B4\uC5ED"),
+            React.createElement("p", { className: "text-xs mb-2", style: { color: C.muted } },
+                "\uACB0\uC0B0 \uC2DC\uC791 \uC804(",
+                periodLabel(shiftPeriod(period, -1, period.start.getDate())),
+                ")\uC5D0 \uB4E4\uC5B4\uC628 \uAE09\uC5EC\uC785\uB2C8\uB2E4. \uC774 \uB3C8\uC5D0\uC11C \uC608\uC801\uAE08\u00B7\uACE0\uC815\uC9C0\uCD9C\uC774 \uBE60\uC838\uB098\uAC00\uBBC0\uB85C ",
+                React.createElement("b", null, "\uC794\uACE0\uC5D0\uB294 \uB354\uD558\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4"),
+                "."),
             React.createElement("div", { className: "flex flex-col gap-2" }, periodSalaryTx.map((t) => (React.createElement("div", { key: t.id, className: "flex items-center justify-between p-2.5 rounded-lg flex-wrap gap-2", style: { background: "#FAF9F6", border: `1px solid ${C.border}` } },
                 React.createElement("div", { className: "flex items-center gap-2 min-w-0 flex-wrap" },
                     React.createElement("span", { className: "text-xs shrink-0", style: { color: C.muted } }, t.date?.slice(5)),
