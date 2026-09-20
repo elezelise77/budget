@@ -14,7 +14,7 @@ const GEMINI_MODEL = "gemini-3.6-flash";
 // 휴대폰용 웹 주소. 빌드할 때 app.config.json 의 mobileWebUrl 값이 여기에 들어간다.
 // (소스를 직접 고칠 필요 없이 app.config.json 만 수정하면 된다.)
 const MOBILE_WEB_URL = "https://elezelise77.github.io/budget/";
-const APP_VERSION = "1.1.0"; // 빌드할 때 package.json 의 version 이 들어간다
+const APP_VERSION = "1.2.0"; // 빌드할 때 package.json 의 version 이 들어간다
 function mobileLink(pairCode) {
     if (!MOBILE_WEB_URL)
         return "";
@@ -173,23 +173,80 @@ function txPocket(t) {
         return t.pocket;
     return t.category === "품위유지비" ? "incidental" : "living";
 }
-// 두 지갑의 잔고를 한 곳에서 계산한다.
-// 잔고 = 예산 - 쓴 돈 + 중간에 채워 넣은 돈(추가 입금)
-// 급여는 "지갑에 채운 돈"이 아니라 예산의 출처이므로 더하지 않는다. 더하면 이중 계산이 된다.
-//   (예: 예산 130만 / 쓴 돈 168만 / 추가 입금 50만 → 잔고 12만, 예산 막대는 그대로 초과 표시)
+// ---------- 두 지갑의 잔고 ----------
+// 규칙 (2026-09 확정)
+//   쓸 수 있는 돈 = 지난 결산에서 남은 돈(이월) + 이번 예산 + 중간에 채워 넣은 돈(추가 입금)
+//   잔고        = 쓸 수 있는 돈 - 쓴 돈,  단 0 밑으로는 내려가지 않는다 (지갑에 마이너스 현금은 없다)
+//   초과        = 쓴 돈 - 쓸 수 있는 돈 (0 이상). 잔고와 따로 빨간 글씨로 보여준다.
+//   예산 막대   = 쓴 돈 / 예산 그대로. "예산은 예산" 이라 이월·입금으로 기준선을 늘리지 않는다.
+// 급여는 예산의 출처라서 채워 넣은 돈에 넣지 않는다. 더하면 이중 계산이 된다.
 function isPocketTopUp(t) { return t.type === "income" && t.category !== "급여"; }
-function computePocketBalances(transactions, budgets, period) {
+// 이월은 앞 결산 결과에 의존하므로, 기록이 있는 가장 오래된 결산부터 차례로 쌓아 올린다.
+const MAX_CARRY_PERIODS = 400; // 무한 루프 방지 (약 33년치)
+function firstRecordedDate(transactions, budgets) {
+    let min = null;
+    for (const t of transactions || []) {
+        if (t && typeof t.date === "string" && t.date && (!min || t.date < min))
+            min = t.date;
+    }
+    for (const k of Object.keys(budgets || {})) {
+        const d = /^\d{4}-\d{2}$/.test(k) ? k + "-01" : null;
+        if (d && (!min || d < min))
+            min = d;
+    }
+    return min;
+}
+// 한 결산 자체의 수치 (이월 제외)
+function periodRaw(transactions, budgets, period) {
     const periodTx = txInPeriod(transactions, period);
     const budgetObj = getBudgetObj(budgets, period);
     const sum = (f) => periodTx.filter(f).reduce((s, t) => s + Number(t.amount || 0), 0);
-    const livingExpense = sum((t) => t.type === "expense" && txPocket(t) !== "incidental");
-    const incidentalExpense = sum((t) => t.type === "expense" && txPocket(t) === "incidental");
-    const livingTopUp = sum((t) => isPocketTopUp(t) && txPocket(t) !== "incidental");
-    const incidentalTopUp = sum((t) => isPocketTopUp(t) && txPocket(t) === "incidental");
-    const livingBalance = budgetObj.total - livingExpense + livingTopUp;
-    const incidentalBalance = budgetObj.incidental - incidentalExpense + incidentalTopUp;
-    return { budgetObj, livingExpense, incidentalExpense, livingTopUp, incidentalTopUp,
-        livingBalance, incidentalBalance, liquidFunds: livingBalance + incidentalBalance };
+    return {
+        budgetObj,
+        livingExpense: sum((t) => t.type === "expense" && txPocket(t) !== "incidental"),
+        incidentalExpense: sum((t) => t.type === "expense" && txPocket(t) === "incidental"),
+        livingTopUp: sum((t) => isPocketTopUp(t) && txPocket(t) !== "incidental"),
+        incidentalTopUp: sum((t) => isPocketTopUp(t) && txPocket(t) === "incidental"),
+    };
+}
+function computePocketBalances(transactions, budgets, period) {
+    const settleDay = period.start.getDate();
+    const firstDate = firstRecordedDate(transactions, budgets);
+    let cur = firstDate ? getCurrentPeriod(new Date(firstDate + "T12:00:00"), settleDay) : period;
+    // 기록보다 앞선 결산을 보고 있으면 이월할 것이 없다.
+    if (cur.start.getTime() > period.start.getTime())
+        cur = period;
+    let livingCarry = 0, incidentalCarry = 0;
+    for (let n = 0; n < MAX_CARRY_PERIODS; n++) {
+        const r = periodRaw(transactions, budgets, cur);
+        const livingAvail = livingCarry + r.budgetObj.total + r.livingTopUp;
+        const incidentalAvail = incidentalCarry + r.budgetObj.incidental + r.incidentalTopUp;
+        const livingBalance = Math.max(0, livingAvail - r.livingExpense);
+        const incidentalBalance = Math.max(0, incidentalAvail - r.incidentalExpense);
+        if (cur.start.getTime() >= period.start.getTime()) {
+            return {
+                ...r, livingCarry, incidentalCarry, livingAvail, incidentalAvail,
+                livingBalance, incidentalBalance,
+                livingOver: Math.max(0, r.livingExpense - livingAvail),
+                incidentalOver: Math.max(0, r.incidentalExpense - incidentalAvail),
+                liquidFunds: livingBalance + incidentalBalance,
+            };
+        }
+        livingCarry = livingBalance;
+        incidentalCarry = incidentalBalance;
+        cur = shiftPeriod(cur, 1, settleDay);
+    }
+    // 여기까지 오면 기간이 비정상적으로 많은 것 — 이월 없이 이번 결산만 계산한다.
+    const r = periodRaw(transactions, budgets, period);
+    const livingAvail = r.budgetObj.total + r.livingTopUp;
+    const incidentalAvail = r.budgetObj.incidental + r.incidentalTopUp;
+    const livingBalance = Math.max(0, livingAvail - r.livingExpense);
+    const incidentalBalance = Math.max(0, incidentalAvail - r.incidentalExpense);
+    return { ...r, livingCarry: 0, incidentalCarry: 0, livingAvail, incidentalAvail,
+        livingBalance, incidentalBalance,
+        livingOver: Math.max(0, r.livingExpense - livingAvail),
+        incidentalOver: Math.max(0, r.incidentalExpense - incidentalAvail),
+        liquidFunds: livingBalance + incidentalBalance };
 }
 function computeLiquidFunds(transactions, budgets, period) {
     return computePocketBalances(transactions, budgets, period).liquidFunds;
@@ -769,6 +826,29 @@ function BudgetBar({ spent, budget }) {
     const over = budget > 0 && spent > budget;
     return React.createElement("div", { className: "h-2.5 rounded-full overflow-hidden", style: { background: "#EFEAE0" } },
         React.createElement("div", { className: "h-2.5 rounded-full", style: { width: `${pct}%`, background: over ? C.negative : C.positive, transition: "width 0.6s cubic-bezier(0.16,1,0.3,1)" } }));
+}
+// 막대 아래 한 줄 + 초과 경고. 대시보드·생활비관리가 같은 것을 쓴다.
+function BudgetLine({ spent, budget, carry, topUp, over, small }) {
+    if (budget <= 0 && carry <= 0 && topUp <= 0)
+        return null;
+    const extras = [];
+    if (carry > 0)
+        extras.push(`+${formatWon(carry)} 이월`);
+    if (topUp > 0)
+        extras.push(`+${formatWon(topUp)} 입금`);
+    const size = small ? "text-[11px]" : "text-xs";
+    return (React.createElement("div", { className: "mt-2" },
+        React.createElement(BudgetBar, { spent: spent, budget: budget }),
+        React.createElement("div", { className: `${size} mt-1`, style: { color: C.muted } },
+            formatWon(spent),
+            " / ",
+            formatWon(budget),
+            " \uC0AC\uC6A9",
+            extras.length ? ` (${extras.join(", ")})` : ""),
+        over > 0 && (React.createElement("div", { className: `${size} mt-1 font-medium`, style: { color: C.negative } },
+            "\u26A0 \uC4F8 \uC218 \uC788\uB294 \uB3C8\uBCF4\uB2E4 ",
+            formatWon(over),
+            " \uB354 \uC37C\uC5B4\uC694"))));
 }
 function PocketToggle({ value, onChange }) {
     const pn = usePocketNames();
@@ -2418,7 +2498,7 @@ function Dashboard({ transactions, savings, events, todos, budgets, totalSavings
     const prevIncome = prevTx.filter((t) => t.type === "income").reduce((s, t) => s + Number(t.amount), 0);
     const prevExpense = prevTx.filter((t) => t.type === "expense").reduce((s, t) => s + Number(t.amount), 0);
     const pb = useMemo(() => computePocketBalances(transactions, budgets, period), [transactions, budgets, period]);
-    const { budgetObj, livingExpense: livingExpenseOnly, incidentalExpense, livingTopUp, incidentalTopUp, livingBalance, incidentalBalance, liquidFunds } = pb;
+    const { budgetObj, livingExpense: livingExpenseOnly, incidentalExpense, livingTopUp, incidentalTopUp, livingCarry, incidentalCarry, livingOver, incidentalOver, livingBalance, incidentalBalance, liquidFunds } = pb;
     const totalAssets = totalSavingsCurrent + liquidFunds;
     const now = new Date();
     const thisMonthNum = now.getMonth() + 1;
@@ -2465,32 +2545,20 @@ function Dashboard({ transactions, savings, events, todos, budgets, totalSavings
                 " \uACB0\uC0B0 \uAE30\uC900"),
             React.createElement("div", { className: "text-xs font-medium px-2.5 py-1 rounded-full", style: { background: daysToSettlement <= 0 ? C.negativeSoft : C.accentSoft, color: daysToSettlement <= 0 ? C.negative : C.accentDeep } }, settlementLabel)),
         React.createElement("div", { className: "grid grid-cols-2 gap-4 md:gap-5" },
-            React.createElement(Card, { lift: true, style: { borderColor: livingBalance < 0 ? C.negative : C.border } },
+            React.createElement(Card, { lift: true, style: { borderColor: livingOver > 0 ? C.negative : C.border } },
                 React.createElement("div", { className: "text-xs md:text-sm", style: { color: C.muted } },
                     pn.living,
                     " \uC794\uACE0"),
-                React.createElement("div", { className: "text-xl md:text-2xl font-semibold mt-1", style: { fontFamily: SERIF, color: livingBalance >= 0 ? C.positive : C.negative } },
+                React.createElement("div", { className: "text-xl md:text-2xl font-semibold mt-1", style: { fontFamily: SERIF, color: livingOver > 0 ? C.negative : C.positive } },
                     React.createElement(AnimatedNumber, { value: livingBalance })),
-                budgetObj.total > 0 && React.createElement("div", { className: "mt-2.5" },
-                    React.createElement(BudgetBar, { spent: livingExpenseOnly, budget: budgetObj.total }),
-                    React.createElement("div", { className: "text-[11px] mt-1", style: { color: C.muted } },
-                        formatWon(livingExpenseOnly),
-                        " / ",
-                        formatWon(budgetObj.total),
-                        livingTopUp > 0 ? ` (+${formatWon(livingTopUp)} 입금)` : ""))),
-            React.createElement(Card, { lift: true, style: { borderColor: incidentalBalance < 0 ? C.negative : C.border } },
+                React.createElement(BudgetLine, { small: true, spent: livingExpenseOnly, budget: budgetObj.total, carry: livingCarry, topUp: livingTopUp, over: livingOver })),
+            React.createElement(Card, { lift: true, style: { borderColor: incidentalOver > 0 ? C.negative : C.border } },
                 React.createElement("div", { className: "text-xs md:text-sm", style: { color: C.muted } },
                     pn.incidental,
                     " \uC794\uACE0"),
-                React.createElement("div", { className: "text-xl md:text-2xl font-semibold mt-1", style: { fontFamily: SERIF, color: incidentalBalance >= 0 ? C.accent : C.negative } },
+                React.createElement("div", { className: "text-xl md:text-2xl font-semibold mt-1", style: { fontFamily: SERIF, color: incidentalOver > 0 ? C.negative : C.accent } },
                     React.createElement(AnimatedNumber, { value: incidentalBalance })),
-                budgetObj.incidental > 0 && React.createElement("div", { className: "mt-2.5" },
-                    React.createElement(BudgetBar, { spent: incidentalExpense, budget: budgetObj.incidental }),
-                    React.createElement("div", { className: "text-[11px] mt-1", style: { color: C.muted } },
-                        formatWon(incidentalExpense),
-                        " / ",
-                        formatWon(budgetObj.incidental),
-                        incidentalTopUp > 0 ? ` (+${formatWon(incidentalTopUp)} 입금)` : ""))),
+                React.createElement(BudgetLine, { small: true, spent: incidentalExpense, budget: budgetObj.incidental, carry: incidentalCarry, topUp: incidentalTopUp, over: incidentalOver })),
             React.createElement(Card, { lift: true },
                 React.createElement("div", { className: "text-xs md:text-sm", style: { color: C.muted } },
                     "\uC774\uBC88\uB2EC \uAE09\uC5EC(",
@@ -2980,13 +3048,13 @@ function BudgetManageModal({ period, budgetObj, onSaveBudget, periodIncomeTx, ad
     const [total, setTotal] = useState(String(budgetObj.total || ""));
     const pn = usePocketNames();
     const [incidental, setIncidental] = useState(String(budgetObj.incidental || ""));
-    const [incForm, setIncForm] = useState({ date: todayStr(), amount: "", category: INCOME_CATS[0], memo: "" });
+    const [incForm, setIncForm] = useState({ date: todayStr(), amount: "", category: INCOME_CATS[0], owner: "", memo: "" });
     const addIncome = (e) => {
         e.preventDefault();
         if (!incForm.amount)
             return;
-        addTransaction({ ...incForm, type: "income", pocket: "living", amount: Number(incForm.amount) });
-        setIncForm({ date: todayStr(), amount: "", category: INCOME_CATS[0], memo: "" });
+        addTransaction({ ...incForm, owner: (incForm.owner || "").trim(), type: "income", pocket: "living", amount: Number(incForm.amount) });
+        setIncForm({ date: todayStr(), amount: "", category: INCOME_CATS[0], owner: incForm.owner, memo: "" });
     };
     return (React.createElement("div", { className: "fixed inset-0 flex items-center justify-center p-4 z-20", style: { background: "rgba(24,26,32,0.5)" } },
         React.createElement(Card, { style: { maxWidth: 560, maxHeight: "88vh", overflowY: "auto" }, className: "w-full relative fade-in-up" },
@@ -3021,7 +3089,9 @@ function BudgetManageModal({ period, budgetObj, onSaveBudget, periodIncomeTx, ad
                     React.createElement(DateInput, { value: incForm.date, onChange: (v) => setIncForm({ ...incForm, date: v }) }),
                     React.createElement(MoneyInput, { value: incForm.amount, onChange: (v) => setIncForm({ ...incForm, amount: v }), placeholder: "\uAE08\uC561" }),
                     React.createElement(SelectInput, { value: incForm.category, onChange: (e) => setIncForm({ ...incForm, category: e.target.value }) }, INCOME_CATS.map((c) => React.createElement("option", { key: c }, c))),
+                    React.createElement(TextInput, { value: incForm.owner, onChange: (e) => setIncForm({ ...incForm, owner: e.target.value }), placeholder: "\uBC1B\uB294 \uC0AC\uB78C (\uC608: \uB0A8\uD3B8)" }),
                     React.createElement(TextInput, { value: incForm.memo, onChange: (e) => setIncForm({ ...incForm, memo: e.target.value }), placeholder: "\uBA54\uBAA8(\uC120\uD0DD)" }),
+                    React.createElement("div", null),
                     React.createElement("div", { className: "col-span-2 flex justify-end" },
                         React.createElement(PrimaryBtn, { type: "submit" },
                             React.createElement(IconPlus, { size: 14 }),
@@ -3031,6 +3101,7 @@ function BudgetManageModal({ period, budgetObj, onSaveBudget, periodIncomeTx, ad
                         React.createElement("span", { className: "text-xs shrink-0", style: { color: C.muted } }, t.date?.slice(5)),
                         React.createElement("span", { className: "truncate" },
                             t.category,
+                            t.owner ? ` · ${t.owner}` : "",
                             t.memo ? ` · ${t.memo}` : "")),
                     React.createElement("div", { className: "flex items-center gap-2 shrink-0" },
                         React.createElement("span", { style: { color: C.positive, fontFamily: SERIF } }, formatWon(t.amount)),
@@ -3237,7 +3308,7 @@ function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTran
     const income = periodIncomeTx.reduce((s, t) => s + Number(t.amount), 0);
     const expense = periodTx.filter((t) => t.type === "expense").reduce((s, t) => s + Number(t.amount), 0);
     const pb = useMemo(() => computePocketBalances(transactions, budgets, period), [transactions, budgets, period]);
-    const { budgetObj, livingExpense, incidentalExpense, livingTopUp, incidentalTopUp } = pb;
+    const { budgetObj, livingExpense, incidentalExpense, livingTopUp, incidentalTopUp, livingCarry, incidentalCarry, livingOver, incidentalOver } = pb;
     const remaining = pb.livingBalance;
     const incidentalRemaining = pb.incidentalBalance;
     const chartData = EXPENSE_CATS.map((cat) => ({ name: cat, value: periodTx.filter((t) => t.type === "expense" && t.category === cat).reduce((s, t) => s + Number(t.amount), 0) })).filter((d) => d.value > 0);
@@ -3246,7 +3317,7 @@ function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTran
         isSettlementDay && (React.createElement("div", { className: "rounded-xl px-4 py-3 text-sm flex items-center justify-between flex-wrap gap-2", style: { background: C.accentSoft, color: C.accentDeep } },
             React.createElement("span", null, "\uC624\uB298\uC740 \uACB0\uC0B0\uC77C\uC774\uC5D0\uC694 \u2014 \uC774\uBC88\uB2EC \uC608\uC0B0\uACFC \uC218\uC785\uC744 \uD655\uC778\uD574\uBCF4\uC138\uC694."),
             React.createElement("button", { onClick: () => setShowBudgetModal(true), className: "text-xs font-medium underline shrink-0" }, "\uC124\uC815\uD558\uAE30"))),
-        React.createElement(Card, { lift: true, style: { borderColor: remaining < 0 ? C.negative : C.border } },
+        React.createElement(Card, { lift: true, style: { borderColor: livingOver > 0 ? C.negative : C.border } },
             React.createElement("div", { className: "flex items-center justify-between mb-3 flex-wrap gap-2" },
                 React.createElement("div", { className: "flex items-center gap-2" },
                     React.createElement(IconBtn, { onClick: () => setPeriod(shiftPeriod(period, -1, settleDay)), title: "\uC774\uC804 \uACB0\uC0B0" },
@@ -3264,30 +3335,16 @@ function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTran
                     React.createElement("div", { className: "text-xs md:text-sm", style: { color: C.muted } },
                         pn.living,
                         " \uC794\uACE0"),
-                    React.createElement("div", { className: "text-2xl md:text-3xl font-semibold mt-1", style: { fontFamily: SERIF, color: remaining >= 0 ? C.positive : C.negative } }, formatWon(remaining)),
-                    budgetObj.total > 0 && (React.createElement("div", { className: "mt-2" },
-                        React.createElement(BudgetBar, { spent: livingExpense, budget: budgetObj.total }),
-                        React.createElement("div", { className: "text-xs mt-1", style: { color: C.muted } },
-                            formatWon(livingExpense),
-                            " / ",
-                            formatWon(budgetObj.total),
-                            " \uC0AC\uC6A9",
-                            livingTopUp > 0 ? ` (+${formatWon(livingTopUp)} 입금)` : ""))),
-                    budgetObj.total === 0 && React.createElement("div", { className: "text-xs mt-2", style: { color: C.muted } }, "\uC608\uC0B0\uC774 \uC124\uC815\uB418\uC9C0 \uC54A\uC558\uC5B4\uC694.")),
+                    React.createElement("div", { className: "text-2xl md:text-3xl font-semibold mt-1", style: { fontFamily: SERIF, color: livingOver > 0 ? C.negative : C.positive } }, formatWon(remaining)),
+                    React.createElement(BudgetLine, { spent: livingExpense, budget: budgetObj.total, carry: livingCarry, topUp: livingTopUp, over: livingOver }),
+                    budgetObj.total === 0 && livingCarry === 0 && livingTopUp === 0 && React.createElement("div", { className: "text-xs mt-2", style: { color: C.muted } }, "\uC608\uC0B0\uC774 \uC124\uC815\uB418\uC9C0 \uC54A\uC558\uC5B4\uC694.")),
                 React.createElement("div", null,
                     React.createElement("div", { className: "text-xs md:text-sm", style: { color: C.muted } },
                         pn.incidental,
                         " \uC794\uACE0"),
-                    React.createElement("div", { className: "text-2xl md:text-3xl font-semibold mt-1", style: { fontFamily: SERIF, color: incidentalRemaining >= 0 ? C.accent : C.negative } }, formatWon(incidentalRemaining)),
-                    budgetObj.incidental > 0 && (React.createElement("div", { className: "mt-2" },
-                        React.createElement(BudgetBar, { spent: incidentalExpense, budget: budgetObj.incidental }),
-                        React.createElement("div", { className: "text-xs mt-1", style: { color: C.muted } },
-                            formatWon(incidentalExpense),
-                            " / ",
-                            formatWon(budgetObj.incidental),
-                            " \uC0AC\uC6A9",
-                            incidentalTopUp > 0 ? ` (+${formatWon(incidentalTopUp)} 입금)` : ""))),
-                    budgetObj.incidental === 0 && React.createElement("div", { className: "text-xs mt-2", style: { color: C.muted } }, "\uC608\uC0B0\uC774 \uC124\uC815\uB418\uC9C0 \uC54A\uC558\uC5B4\uC694.")))),
+                    React.createElement("div", { className: "text-2xl md:text-3xl font-semibold mt-1", style: { fontFamily: SERIF, color: incidentalOver > 0 ? C.negative : C.accent } }, formatWon(incidentalRemaining)),
+                    React.createElement(BudgetLine, { spent: incidentalExpense, budget: budgetObj.incidental, carry: incidentalCarry, topUp: incidentalTopUp, over: incidentalOver }),
+                    budgetObj.incidental === 0 && incidentalCarry === 0 && incidentalTopUp === 0 && React.createElement("div", { className: "text-xs mt-2", style: { color: C.muted } }, "\uC608\uC0B0\uC774 \uC124\uC815\uB418\uC9C0 \uC54A\uC558\uC5B4\uC694.")))),
         periodSalaryTx.length > 0 && (React.createElement(Card, null,
             React.createElement(SectionTitle, null, "\uC774\uBC88 \uACB0\uC0B0 \uAE09\uC5EC \uB0B4\uC5ED"),
             React.createElement("div", { className: "flex flex-col gap-2" }, periodSalaryTx.map((t) => (React.createElement("div", { key: t.id, className: "flex items-center justify-between p-2.5 rounded-lg flex-wrap gap-2", style: { background: "#FAF9F6", border: `1px solid ${C.border}` } },
