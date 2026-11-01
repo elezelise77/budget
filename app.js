@@ -14,7 +14,7 @@ const GEMINI_MODEL = "gemini-3.6-flash";
 // 휴대폰용 웹 주소. 빌드할 때 app.config.json 의 mobileWebUrl 값이 여기에 들어간다.
 // (소스를 직접 고칠 필요 없이 app.config.json 만 수정하면 된다.)
 const MOBILE_WEB_URL = "https://elezelise77.github.io/budget/";
-const APP_VERSION = "1.4.0"; // 빌드할 때 package.json 의 version 이 들어간다
+const APP_VERSION = "1.5.1"; // 빌드할 때 package.json 의 version 이 들어간다
 function mobileLink(pairCode) {
     if (!MOBILE_WEB_URL)
         return "";
@@ -495,6 +495,11 @@ const IconList = (p) => React.createElement(Icon, { ...p },
     React.createElement("line", { x1: "4", y1: "6", x2: "20", y2: "6" }),
     React.createElement("line", { x1: "4", y1: "12", x2: "20", y2: "12" }),
     React.createElement("line", { x1: "4", y1: "18", x2: "20", y2: "18" }));
+const IconClipboard = (p) => React.createElement(Icon, { ...p },
+    React.createElement("rect", { x: "8", y: "3", width: "8", height: "4", rx: "1" }),
+    React.createElement("path", { d: "M16 5h2a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2" }),
+    React.createElement("line", { x1: "9", y1: "12", x2: "15", y2: "12" }),
+    React.createElement("line", { x1: "9", y1: "16", x2: "13", y2: "16" }));
 const IconStar = (p) => React.createElement(Icon, { ...p },
     React.createElement("polygon", { points: "12 2 15 8.5 22 9.3 17 14 18.2 21 12 17.5 5.8 21 7 14 2 9.3 9 8.5 12 2" }));
 const IconExpand = (p) => React.createElement(Icon, { ...p },
@@ -731,6 +736,17 @@ async function importBackupFile() {
         };
         input.click();
     });
+}
+// data URL → File. Electron 클립보드에서 읽은 그림을 파일처럼 다루기 위해.
+function dataUrlToFile(dataUrl, name) {
+    const m = /^data:([^;]+);base64,(.*)$/.exec(dataUrl || "");
+    if (!m)
+        return null;
+    const bin = atob(m[2]);
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++)
+        arr[i] = bin.charCodeAt(i);
+    return new File([arr], name || "clipboard.png", { type: m[1] });
 }
 async function fileToResizedBase64(file, maxDim, quality) {
     maxDim = maxDim || 1600;
@@ -1495,9 +1511,10 @@ function MockAiCopy() {
 function GeminiGuideModal({ onClose, currentKey, onSave }) {
     const [draft, setDraft] = useState(currentKey || "");
     const [copiedMsg, setCopiedMsg] = useState(null);
-    return (React.createElement("div", { className: "fixed inset-0 flex items-center justify-center p-6 z-30", style: { background: "rgba(24,26,32,0.45)" } },
+    return (React.createElement("div", { className: "fixed inset-0 flex items-center justify-center p-6 z-30", style: { background: "rgba(24,26,32,0.45)" }, onMouseDown: (e) => { if (e.target === e.currentTarget)
+            onClose(); } },
         React.createElement(Card, { style: { maxWidth: 520, maxHeight: "90vh", overflowY: "auto" }, className: "w-full relative fade-in-up" },
-            React.createElement("div", { className: "flex justify-end" },
+            React.createElement("div", { className: "modal-topbar", style: { background: C.surface } },
                 React.createElement(IconBtn, { onClick: onClose, title: "\uB2EB\uAE30" },
                     React.createElement(IconX, { size: 16 }))),
             React.createElement("div", { className: "text-xs tracking-widest mb-1", style: { color: C.accent } }, "AI \uC601\uC218\uC99D \uC778\uC2DD"),
@@ -1553,9 +1570,10 @@ function StorageUpdateModal({ cfg, onClose, onRecheck }) {
     const [checking, setChecking] = useState(false);
     const [msg, setMsg] = useState(null);
     const code = useMemo(() => APPS_SCRIPT_TEMPLATE.replace("__APP_TOKEN__", (cfg && cfg.token) || "__APP_TOKEN__"), [cfg]);
-    return (React.createElement("div", { className: "fixed inset-0 flex items-center justify-center p-6 z-30", style: { background: "rgba(24,26,32,0.45)" } },
+    return (React.createElement("div", { className: "fixed inset-0 flex items-center justify-center p-6 z-30", style: { background: "rgba(24,26,32,0.45)" }, onMouseDown: (e) => { if (e.target === e.currentTarget)
+            onClose(); } },
         React.createElement(Card, { style: { maxWidth: 560, maxHeight: "90vh", overflowY: "auto" }, className: "w-full relative fade-in-up" },
-            React.createElement("div", { className: "flex justify-end" },
+            React.createElement("div", { className: "modal-topbar", style: { background: C.surface } },
                 React.createElement(IconBtn, { onClick: onClose, title: "\uB2EB\uAE30" },
                     React.createElement(IconX, { size: 16 }))),
             React.createElement("div", { className: "text-xs tracking-widest mb-1", style: { color: C.accent } }, "\uC800\uC7A5\uC18C \uC5C5\uB370\uC774\uD2B8"),
@@ -1623,9 +1641,10 @@ function HelpModal({ onClose, onGoTab }) {
     const [sel, setSel] = useState("dashboard");
     const cur = TAB_GUIDE.find((t) => t.id === sel) || TAB_GUIDE[0];
     const CurIcon = cur.icon;
-    return (React.createElement("div", { className: "fixed inset-0 flex items-center justify-center p-6 z-30", style: { background: "rgba(24,26,32,0.45)" } },
+    return (React.createElement("div", { className: "fixed inset-0 flex items-center justify-center p-6 z-30", style: { background: "rgba(24,26,32,0.45)" }, onMouseDown: (e) => { if (e.target === e.currentTarget)
+            onClose(); } },
         React.createElement(Card, { style: { maxWidth: 720, maxHeight: "88vh", overflowY: "auto" }, className: "w-full relative fade-in-up" },
-            React.createElement("div", { className: "flex justify-end" },
+            React.createElement("div", { className: "modal-topbar", style: { background: C.surface } },
                 React.createElement(IconBtn, { onClick: onClose, title: "\uB2EB\uAE30" },
                     React.createElement(IconX, { size: 16 }))),
             React.createElement("div", { className: "text-xs tracking-widest mb-1", style: { color: C.accent } }, "\uC0AC\uC6A9 \uC548\uB0B4"),
@@ -1946,6 +1965,8 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
     const [titleDraft, setTitleDraft] = useState("");
     const [pocketDraft, setPocketDraft] = useState(POCKET_DEFAULTS);
     const [settleDraft, setSettleDraft] = useState(SETTLE_DAY_DEFAULT);
+    const [showSyncMsg, setShowSyncMsg] = useState(false);
+    const closeSettings = () => { setShowSettings(false); setIoMsg(null); setResetMode(null); setResetMsg(null); };
     const [importUrl, setImportUrl] = useState(""); // 옛 가계부 주소
     const [importing, setImporting] = useState(null); // {i, total} 진행 상황
     const [resetMode, setResetMode] = useState(null);
@@ -2324,16 +2345,30 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
                         React.createElement("div", { className: "desktop-wrap flex items-center justify-between gap-3" },
                             React.createElement("h1", { className: "text-xl md:text-3xl font-semibold shrink-0", style: { fontFamily: SERIF } }, currentLabel),
                             React.createElement("div", { className: "flex items-center gap-2 md:gap-3 min-w-0" },
-                                syncError ? (React.createElement("div", { className: "flex items-center gap-1 text-xs shrink-0", style: { color: C.negative } },
+                                syncError ? (
+                                // 휴대폰에서는 글자가 안 들어가 아이콘만 보인다. 눌러서 내용을 볼 수 있게 한다.
+                                React.createElement("button", { onClick: () => setShowSyncMsg((v) => !v), title: syncError, className: "flex items-center gap-1 text-xs shrink-0", style: { color: C.negative } },
                                     React.createElement(IconWifiOff, { size: 13 }),
                                     " ",
-                                    React.createElement("span", { className: "hidden sm:inline" }, syncError))) : (React.createElement("div", { className: "text-xs hidden sm:block shrink-0", style: { color: C.muted } }, lastSynced ? `${lastSynced.toLocaleTimeString("ko-KR")} 동기화됨` : "")),
+                                    React.createElement("span", { className: "hidden sm:inline" }, syncError),
+                                    React.createElement("span", { className: "sm:hidden underline" }, "\uC5F0\uACB0 \uC548\uB428"))) : (React.createElement("div", { className: "text-xs hidden sm:block shrink-0", style: { color: C.muted } }, lastSynced ? `${lastSynced.toLocaleTimeString("ko-KR")} 동기화됨` : "")),
                                 React.createElement(IconBtn, { onClick: () => reloadAll(true), title: "\uC0C8\uB85C\uACE0\uCE68" },
                                     React.createElement(IconRefresh, { size: 16, style: { animation: syncing ? "spin 0.8s linear infinite" : "none" } })),
                                 React.createElement(IconBtn, { onClick: () => setShowHelp(true), title: "\uC0AC\uC6A9 \uC548\uB0B4" },
                                     React.createElement(IconHelp, { size: 16 })),
                                 React.createElement(IconBtn, { onClick: () => { setTitleDraft(title); setPocketDraft(pockets); setSettleDraft(settleDay); setShowSettings(true); }, title: "\uC5F0\uACB0 \uC124\uC815" },
                                     React.createElement(IconSettings, { size: 16 }))))),
+                    syncError && showSyncMsg && (React.createElement("div", { className: "px-4 md:px-8 py-3 sm:hidden", style: { background: C.negativeSoft } },
+                        React.createElement("div", { className: "text-xs leading-relaxed", style: { color: C.negative } }, syncError),
+                        React.createElement("div", { className: "text-xs mt-2 leading-relaxed", style: { color: "#7B4034" } },
+                            "\uC774 \uBE0C\uB77C\uC6B0\uC800\uAC00 \uAC00\uACC4\uBD80\uC5D0 \uC5F0\uACB0\uB418\uC5B4 \uC788\uC9C0 \uC54A\uC744 \uC218 \uC788\uC5B4\uC694. PC \uC571 \uC124\uC815(\u2699)\uC758 ",
+                            React.createElement("b", null, "QR"),
+                            " \uC744 \uC774 \uBE0C\uB77C\uC6B0\uC800\uB85C \uCC0D\uAC70\uB098,",
+                            React.createElement("b", null, " \uD734\uB300\uD3F0\uC6A9 \uC8FC\uC18C \uBCF5\uC0AC"),
+                            " \uB85C \uBC1B\uC740 \uC8FC\uC18C\uB97C \uC774 \uBE0C\uB77C\uC6B0\uC800 \uC8FC\uC18C\uCC3D\uC5D0 \uC9C1\uC811 \uBD99\uC5EC\uB123\uC5B4 \uC8FC\uC138\uC694."),
+                        React.createElement("div", { className: "flex gap-2 mt-2" },
+                            React.createElement("button", { onClick: () => reloadAll(true), className: "text-xs px-3 py-1.5 rounded-lg font-medium", style: { background: "#fff", color: C.inkSoft } }, "\uB2E4\uC2DC \uC2DC\uB3C4"),
+                            React.createElement("button", { onClick: () => setShowSyncMsg(false), className: "text-xs px-3 py-1.5 rounded-lg", style: { color: C.muted } }, "\uB2EB\uAE30")))),
                     React.createElement("main", { key: tab, className: "flex-1 min-w-0 p-4 md:p-8 overflow-y-auto fade-in-up" },
                         React.createElement("div", { className: "desktop-wrap" },
                             storageOld && (React.createElement("div", { className: "rounded-xl p-3 mb-4 flex items-center justify-between gap-3 flex-wrap", style: { background: C.accentSoft, border: `1px solid ${C.accent}` } },
@@ -2355,10 +2390,11 @@ function MainApp({ cfg, onChangeServer, onSaveGeminiKey }) {
                         React.createElement(IconComp, { size: 18, color: active ? C.ink : C.muted }),
                         React.createElement("span", { className: "text-[9.5px] leading-tight truncate w-full text-center px-0.5", style: { color: active ? C.ink : C.muted, fontWeight: active ? 600 : 400 } }, n.shortLabel)));
                 })),
-                showSettings && (React.createElement("div", { className: "fixed inset-0 flex items-center justify-center p-6 z-20", style: { background: "rgba(24,26,32,0.45)" } },
+                showSettings && (React.createElement("div", { className: "fixed inset-0 flex items-center justify-center p-6 z-20", style: { background: "rgba(24,26,32,0.45)" }, onMouseDown: (e) => { if (e.target === e.currentTarget)
+                        closeSettings(); } },
                     React.createElement(Card, { style: { maxWidth: 460, maxHeight: "88vh", overflowY: "auto" }, className: "w-full relative fade-in-up" },
-                        React.createElement("div", { className: "flex justify-end" },
-                            React.createElement(IconBtn, { onClick: () => { setShowSettings(false); setIoMsg(null); setResetMode(null); setResetMsg(null); }, title: "\uB2EB\uAE30" },
+                        React.createElement("div", { className: "modal-topbar", style: { background: C.surface } },
+                            React.createElement(IconBtn, { onClick: closeSettings, title: "\uB2EB\uAE30" },
                                 React.createElement(IconX, { size: 16 }))),
                         React.createElement("h3", { className: "text-base font-semibold mb-3", style: { fontFamily: SERIF } }, "\uC124\uC815"),
                         React.createElement("p", { className: "text-sm font-medium mb-1" }, "\uAC00\uACC4\uBD80 \uC774\uB984"),
@@ -3073,9 +3109,10 @@ function BudgetManageModal({ period, budgetObj, onSaveBudget, periodIncomeTx, ad
         addTransaction({ ...incForm, owner: (incForm.owner || "").trim(), type: "income", pocket: "living", amount: Number(incForm.amount) });
         setIncForm({ date: defaultIncomeDate(incForm.category), amount: "", category: incForm.category, owner: incForm.owner, memo: "" });
     };
-    return (React.createElement("div", { className: "fixed inset-0 flex items-center justify-center p-4 z-20", style: { background: "rgba(24,26,32,0.5)" } },
+    return (React.createElement("div", { className: "fixed inset-0 flex items-center justify-center p-4 z-20", style: { background: "rgba(24,26,32,0.5)" }, onMouseDown: (e) => { if (e.target === e.currentTarget)
+            onClose(); } },
         React.createElement(Card, { style: { maxWidth: 560, maxHeight: "88vh", overflowY: "auto" }, className: "w-full relative fade-in-up" },
-            React.createElement("div", { className: "flex justify-between items-start mb-1" },
+            React.createElement("div", { className: "modal-topbar items-start mb-1", style: { background: C.surface, justifyContent: "space-between" } },
                 React.createElement("div", null,
                     React.createElement("div", { className: "text-xs tracking-widest", style: { color: C.accent } }, "BUDGET"),
                     React.createElement("h3", { className: "text-lg font-semibold", style: { fontFamily: SERIF } },
@@ -3180,9 +3217,10 @@ function BatchReviewModal({ items, onConfirm, onClose }) {
         const toAdd = rows.filter((r) => r.include && r.amount).map((r) => ({ date: r.date, type: r.type, pocket: "living", category: r.category, amount: Number(r.amount) || 0, memo: r.merchant }));
         onConfirm(toAdd);
     };
-    return (React.createElement("div", { className: "fixed inset-0 flex items-center justify-center p-4 z-20", style: { background: "rgba(24,26,32,0.5)" } },
+    return (React.createElement("div", { className: "fixed inset-0 flex items-center justify-center p-4 z-20", style: { background: "rgba(24,26,32,0.5)" }, onMouseDown: (e) => { if (e.target === e.currentTarget)
+            onClose(); } },
         React.createElement(Card, { style: { maxWidth: 780, maxHeight: "88vh", overflowY: "auto" }, className: "w-full relative fade-in-up" },
-            React.createElement("div", { className: "flex justify-between items-start mb-3" },
+            React.createElement("div", { className: "modal-topbar items-start mb-3", style: { background: C.surface, justifyContent: "space-between" } },
                 React.createElement("div", null,
                     React.createElement("div", { className: "text-xs tracking-widest", style: { color: C.accent } }, "BATCH IMPORT"),
                     React.createElement("h3", { className: "text-lg font-semibold", style: { fontFamily: SERIF } },
@@ -3240,6 +3278,7 @@ function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTran
     const [aiStartedAt, setAiStartedAt] = useState(0);
     const [batchItems, setBatchItems] = useState(null);
     const [batchCount, setBatchCount] = useState(null); // {done,total} 여러 장 진행 상황
+    const [dragOver, setDragOver] = useState(false);
     const fileInputRef = useRef(null);
     const batchInputRef = useRef(null);
     const ownerNames = useMemo(() => Array.from(new Set(transactions.map((t) => t.owner).filter(Boolean))), [transactions]);
@@ -3340,6 +3379,47 @@ function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTran
         }
     };
     const handleBatchUpload = (e) => { runBatch(e.target.files); };
+    // [붙여넣기] 버튼: Ctrl+V 가 먹지 않는 경우를 위해 OS 클립보드를 직접 읽는다.
+    const pasteFromClipboard = async () => {
+        setBatchError(null);
+        try {
+            if (IS_DESKTOP && DESKTOP.readClipboardImage) {
+                const dataUrl = await DESKTOP.readClipboardImage();
+                const f = dataUrl && dataUrlToFile(dataUrl, "clipboard.png");
+                if (f) {
+                    runBatch([f]);
+                    return;
+                }
+                setBatchError("클립보드에 그림이 없어요. 화면을 캡처(Win+Shift+S)한 뒤 다시 눌러주세요.");
+                return;
+            }
+            if (navigator.clipboard && navigator.clipboard.read) {
+                const items = await navigator.clipboard.read();
+                const files = [];
+                for (const it of items) {
+                    const type = it.types.find((t) => /^image\//.test(t));
+                    if (type)
+                        files.push(new File([await it.getType(type)], "clipboard.png", { type }));
+                }
+                if (files.length) {
+                    runBatch(files);
+                    return;
+                }
+            }
+            setBatchError("클립보드에 그림이 없어요. 화면을 캡처한 뒤 다시 눌러주세요.");
+        }
+        catch (err) {
+            setBatchError("붙여넣기 실패: " + (err.message || err) + " — 화면을 클릭한 뒤 Ctrl+V 로 시도해보세요.");
+        }
+    };
+    // 사진 파일을 창에 끌어다 놓아도 인식한다.
+    const onDrop = (e) => {
+        e.preventDefault();
+        setDragOver(false);
+        const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []);
+        if (files.length)
+            runBatch(files);
+    };
     // 캡처한 화면을 Ctrl+V 로 바로 붙여넣기. 파일로 저장할 필요가 없다.
     useEffect(() => {
         const onPaste = (e) => {
@@ -3449,7 +3529,11 @@ function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTran
         React.createElement(Card, null,
             React.createElement(SectionTitle, null, editingTxId ? "거래 수정" : "거래 추가"),
             React.createElement("datalist", { id: "tx-owner-suggestions" }, ownerNames.map((o) => React.createElement("option", { key: o, value: o }))),
-            React.createElement("div", { className: "mb-4 pb-4 flex items-center gap-3 flex-wrap", style: { borderBottom: `1px dashed ${C.border}` } },
+            React.createElement("div", { className: "mb-4 pb-4 flex items-center gap-3 flex-wrap rounded-xl transition-all duration-150", onDragOver: (e) => { e.preventDefault(); if (!dragOver)
+                    setDragOver(true); }, onDragLeave: (e) => { if (e.currentTarget === e.target)
+                    setDragOver(false); }, onDrop: onDrop, style: { borderBottom: `1px dashed ${C.border}`,
+                    outline: dragOver ? `2px dashed ${C.accent}` : "none", outlineOffset: 6,
+                    background: dragOver ? C.accentSoft : "transparent" } },
                 React.createElement("label", { className: "inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium cursor-pointer transition-all duration-150 hover:opacity-90", style: { background: C.accentSoft, color: C.accentDeep } },
                     React.createElement(IconCamera, { size: 16 }),
                     " \uC601\uC218\uC99D \uD55C \uAC74 \uC790\uB3D9 \uC785\uB825",
@@ -3458,9 +3542,14 @@ function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTran
                     React.createElement(IconList, { size: 16 }),
                     " \uCE74\uB4DC \uB0B4\uC5ED \uC77C\uAD04 \uC785\uB825",
                     React.createElement("input", { ref: batchInputRef, type: "file", accept: "image/*", multiple: true, onChange: handleBatchUpload, style: { display: "none" }, disabled: batchBusy })),
-                React.createElement("span", { className: "text-xs", style: { color: C.muted } },
-                    "\uC0AC\uC9C4 \uC5EC\uB7EC \uC7A5 \uD55C\uAEBC\uBC88\uC5D0 \uC120\uD0DD\uD560 \uC218 \uC788\uC5B4\uC694",
-                    IS_DESKTOP ? " · 캡처한 화면은 Ctrl+V 로 바로 붙여넣기" : ""),
+                IS_DESKTOP && (React.createElement("button", { onClick: pasteFromClipboard, disabled: batchBusy || ocrBusy, className: "inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all duration-150 hover:opacity-90", style: { background: "#EFEAE0", color: C.inkSoft, opacity: (batchBusy || ocrBusy) ? 0.5 : 1 } },
+                    React.createElement(IconClipboard, { size: 16 }),
+                    " \uCEA1\uCC98\uD55C \uD654\uBA74 \uBD99\uC5EC\uB123\uAE30")),
+                React.createElement("span", { className: "text-xs w-full", style: { color: C.muted } },
+                    "\uC0AC\uC9C4 ",
+                    React.createElement("b", null, "\uC5EC\uB7EC \uC7A5"),
+                    "\uC744 \uD55C\uAEBC\uBC88\uC5D0 \uACE0\uB97C \uC218 \uC788\uC5B4\uC694",
+                    IS_DESKTOP ? " · 캡처(Win+Shift+S) 후 Ctrl+V 또는 위 버튼 · 파일을 이 영역에 끌어다 놓아도 됩니다" : " · 사진을 여러 장 선택하세요"),
                 !cfg.geminiKey && (React.createElement("button", { onClick: onOpenSettings, className: "text-xs underline", style: { color: C.accent } }, "Gemini API \uD0A4 \uC124\uC815\uD558\uAE30")),
                 ocrError && React.createElement("span", { className: "text-xs", style: { color: C.negative } }, ocrError),
                 batchError && React.createElement("div", { className: "text-xs w-full mt-2 p-3 rounded-lg", style: { color: C.negative, background: C.negativeSoft, wordBreak: "break-word", whiteSpace: "pre-wrap", fontFamily: "monospace", fontSize: 11 } }, batchError),
