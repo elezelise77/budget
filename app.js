@@ -14,7 +14,7 @@ const GEMINI_MODEL = "gemini-3.6-flash";
 // 휴대폰용 웹 주소. 빌드할 때 app.config.json 의 mobileWebUrl 값이 여기에 들어간다.
 // (소스를 직접 고칠 필요 없이 app.config.json 만 수정하면 된다.)
 const MOBILE_WEB_URL = "https://elezelise77.github.io/budget/";
-const APP_VERSION = "1.3.0"; // 빌드할 때 package.json 의 version 이 들어간다
+const APP_VERSION = "1.4.0"; // 빌드할 때 package.json 의 version 이 들어간다
 function mobileLink(pairCode) {
     if (!MOBILE_WEB_URL)
         return "";
@@ -3142,19 +3142,26 @@ function BudgetManageModal({ period, budgetObj, onSaveBudget, periodIncomeTx, ad
 // ---------- 카드 내역 일괄 검토 모달 ----------
 function BatchReviewModal({ items, onConfirm, onClose }) {
     const pn = usePocketNames();
-    const [rows, setRows] = useState(items.map((it) => {
-        const type = it.type === "income" ? "income" : "expense";
-        const cats = type === "income" ? INCOME_CATS : EXPENSE_CATS;
-        return {
-            id: uid(),
-            date: it.date || todayStr(),
-            amount: it.amount != null ? String(it.amount) : "",
-            merchant: it.merchant || "",
-            type,
-            category: cats.includes(it.category) ? it.category : cats[0],
-            include: true,
-        };
-    }));
+    // 사진 여러 장을 올리면 겹치는 구간이 중복으로 들어온다.
+    // 날짜·금액·가게·구분이 똑같은 두 번째 건은 미리 체크를 풀고 "중복?" 으로 표시한다. (지우지는 않는다)
+    const [rows, setRows] = useState(() => {
+        const seen = new Set();
+        return items.map((it) => {
+            const type = it.type === "income" ? "income" : "expense";
+            const cats = type === "income" ? INCOME_CATS : EXPENSE_CATS;
+            const date = it.date || todayStr();
+            const amount = it.amount != null ? String(it.amount) : "";
+            const merchant = it.merchant || "";
+            const key = [date, amount, merchant, type].join("|");
+            const dup = seen.has(key);
+            seen.add(key);
+            return {
+                id: uid(), date, amount, merchant, type,
+                category: cats.includes(it.category) ? it.category : cats[0],
+                include: !dup, dup,
+            };
+        });
+    });
     const updateRow = (id, patch) => setRows((prev) => prev.map((r) => {
         if (r.id !== id)
             return r;
@@ -3168,6 +3175,7 @@ function BatchReviewModal({ items, onConfirm, onClose }) {
     }));
     const toggleAll = (val) => setRows((prev) => prev.map((r) => ({ ...r, include: val })));
     const includedCount = rows.filter((r) => r.include).length;
+    const dupCount = rows.filter((r) => r.dup).length;
     const confirm = () => {
         const toAdd = rows.filter((r) => r.include && r.amount).map((r) => ({ date: r.date, type: r.type, pocket: "living", category: r.category, amount: Number(r.amount) || 0, memo: r.merchant }));
         onConfirm(toAdd);
@@ -3180,7 +3188,9 @@ function BatchReviewModal({ items, onConfirm, onClose }) {
                     React.createElement("h3", { className: "text-lg font-semibold", style: { fontFamily: SERIF } },
                         "\uCE74\uB4DC \uB0B4\uC5ED \uC77C\uAD04 \uD655\uC778 (",
                         rows.length,
-                        "\uAC74 \uC778\uC2DD)")),
+                        "\uAC74 \uC778\uC2DD",
+                        dupCount > 0 ? `, 중복 의심 ${dupCount}건 제외` : "",
+                        ")")),
                 React.createElement(IconBtn, { onClick: onClose },
                     React.createElement(IconX, { size: 16 }))),
             React.createElement("p", { className: "text-xs mb-3", style: { color: C.muted } },
@@ -3194,6 +3204,7 @@ function BatchReviewModal({ items, onConfirm, onClose }) {
                 React.createElement("button", { onClick: () => toggleAll(false), className: "text-xs", style: { color: C.muted } }, "\uC804\uCCB4 \uD574\uC81C")),
             React.createElement("div", { className: "flex flex-col gap-2" }, rows.map((r) => (React.createElement("div", { key: r.id, className: "flex items-center gap-2 p-2 rounded-lg flex-wrap", style: { background: r.include ? (r.type === "income" ? C.positiveSoft : "#FAF9F6") : "transparent", opacity: r.include ? 1 : 0.45, border: `1px solid ${r.type === "income" && r.include ? C.positive : C.border}` } },
                 React.createElement("input", { type: "checkbox", checked: r.include, onChange: (e) => updateRow(r.id, { include: e.target.checked }) }),
+                r.dup && React.createElement("span", { className: "text-[10px] px-1.5 py-0.5 rounded-md shrink-0 font-medium", style: { background: C.accentSoft, color: C.accentDeep } }, "\uC911\uBCF5?"),
                 React.createElement("div", { style: { width: 215 } },
                     React.createElement(DateInput, { value: r.date, onChange: (v) => updateRow(r.id, { date: v }) })),
                 React.createElement(SelectInput, { value: r.type, onChange: (e) => updateRow(r.id, { type: e.target.value }), style: { width: 78, color: r.type === "income" ? C.positive : C.negative, fontWeight: 600 } },
@@ -3228,6 +3239,7 @@ function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTran
     const [aiStage, setAiStage] = useState(null); // 지금 어느 단계인지
     const [aiStartedAt, setAiStartedAt] = useState(0);
     const [batchItems, setBatchItems] = useState(null);
+    const [batchCount, setBatchCount] = useState(null); // {done,total} 여러 장 진행 상황
     const fileInputRef = useRef(null);
     const batchInputRef = useRef(null);
     const ownerNames = useMemo(() => Array.from(new Set(transactions.map((t) => t.owner).filter(Boolean))), [transactions]);
@@ -3272,46 +3284,85 @@ function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTran
                 fileInputRef.current.value = "";
         }
     };
-    const handleBatchUpload = async (e) => {
-        const file = e.target.files[0];
-        if (!file)
+    // 사진 여러 장을 차례로 읽어 하나의 목록으로 합친다.
+    // (카톡으로 받은 카드내역 스크린샷이 보통 여러 장이라 한 장씩 올리기 번거롭다는 요청)
+    const runBatch = async (files) => {
+        const list = Array.from(files || []).filter((f) => f && /^image\//.test(f.type));
+        if (list.length === 0)
+            return;
+        if (!cfg.geminiKey) {
+            setBatchError("설정(⚙)에서 Gemini API 키를 먼저 입력해주세요.");
+            return;
+        }
+        if (batchBusy || ocrBusy)
             return;
         setBatchBusy(true);
         setBatchError(null);
+        setBatchCount({ done: 0, total: list.length });
         setAiStartedAt(Date.now());
-        setAiStage("화면 사진을 준비하고 있어요");
+        setAiStage(list.length > 1 ? `화면 사진 ${list.length}장을 준비하고 있어요` : "화면 사진을 준비하고 있어요");
+        const all = [];
+        const failed = [];
         try {
-            if (!cfg.geminiKey) {
-                setBatchError("설정(⚙)에서 Gemini API 키를 먼저 입력해주세요.");
-                setBatchBusy(false);
-                setAiStage(null);
-                if (batchInputRef.current)
-                    batchInputRef.current.value = "";
-                return;
+            for (let i = 0; i < list.length; i++) {
+                const nth = list.length > 1 ? ` (${i + 1}/${list.length}장)` : "";
+                try {
+                    const { base64, mimeType } = await fileToResizedBase64(list[i], 1800, 0.85);
+                    setAiStage(`AI 가 거래내역을 읽는 중${nth}`);
+                    const rawText = await callGeminiWithRetry(cfg.geminiKey, GEMINI_MODEL, buildBatchPrompt(todayStr()), base64, mimeType, (n) => setAiStage(n === 0 ? `AI 가 거래내역을 읽는 중${nth}` : `혼잡해서 다시 시도하는 중${nth} (${n + 1}/3)`));
+                    let arr = JSON.parse(extractJsonFromText(rawText, "[", "]"));
+                    arr = Array.isArray(arr) ? arr : [arr];
+                    for (const it of arr)
+                        all.push(it);
+                }
+                catch (err) {
+                    failed.push(`${i + 1}번째 사진: ${err.name === "AbortError" ? "시간 초과" : err.message}`);
+                }
+                setBatchCount({ done: i + 1, total: list.length });
             }
-            const { base64, mimeType } = await fileToResizedBase64(file, 1800, 0.85);
-            setAiStage("AI 가 거래내역을 읽는 중");
-            const rawText = await callGeminiWithRetry(cfg.geminiKey, GEMINI_MODEL, buildBatchPrompt(todayStr()), base64, mimeType, (n) => setAiStage(n === 0 ? "AI 가 거래내역을 읽는 중" : `혼잡해서 다시 시도하는 중 (${n + 1}/3)`));
             setAiStage("결과를 정리하는 중");
-            let arr = JSON.parse(extractJsonFromText(rawText, "[", "]"));
-            arr = Array.isArray(arr) ? arr : [arr];
-            if (arr.length === 0)
-                throw new Error("화면에서 거래를 찾지 못했어요. 사진을 다시 확인해주세요.");
-            setBatchItems(arr);
+            if (all.length === 0) {
+                throw new Error(failed.length ? failed.join("\n") : "화면에서 거래를 찾지 못했어요. 사진을 다시 확인해주세요.");
+            }
+            if (failed.length)
+                setBatchError("일부 사진을 읽지 못했어요 (나머지는 아래에서 확인하세요)\n" + failed.join("\n"));
+            setBatchItems(all);
         }
         catch (err) {
-            if (err.name === "AbortError")
-                setBatchError("일괄 인식 실패: 요청 시간 초과 - 다시 시도해주세요.");
-            else
-                setBatchError("일괄 인식 실패: " + err.message);
+            setBatchError("일괄 인식 실패: " + err.message);
         }
         finally {
             setBatchBusy(false);
             setAiStage(null);
+            setBatchCount(null);
             if (batchInputRef.current)
                 batchInputRef.current.value = "";
         }
     };
+    const handleBatchUpload = (e) => { runBatch(e.target.files); };
+    // 캡처한 화면을 Ctrl+V 로 바로 붙여넣기. 파일로 저장할 필요가 없다.
+    useEffect(() => {
+        const onPaste = (e) => {
+            const t = e.target;
+            if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable))
+                return; // 글자 붙여넣기는 그대로
+            const items = (e.clipboardData && e.clipboardData.items) || [];
+            const files = [];
+            for (const it of items) {
+                if (it.kind === "file" && /^image\//.test(it.type)) {
+                    const f = it.getAsFile();
+                    if (f)
+                        files.push(f);
+                }
+            }
+            if (files.length === 0)
+                return;
+            e.preventDefault();
+            runBatch(files);
+        };
+        window.addEventListener("paste", onPaste);
+        return () => window.removeEventListener("paste", onPaste);
+    });
     const startEditTx = (t) => {
         setEditingTxId(t.id);
         setForm({ date: t.date, type: t.type, pocket: txPocket(t), category: t.category, amount: String(t.amount), memo: t.memo || "", owner: t.owner || "" });
@@ -3406,14 +3457,19 @@ function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTran
                 React.createElement("label", { className: "inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium cursor-pointer transition-all duration-150 hover:opacity-90", style: { background: "#EFEAE0", color: C.inkSoft } },
                     React.createElement(IconList, { size: 16 }),
                     " \uCE74\uB4DC \uB0B4\uC5ED \uC77C\uAD04 \uC785\uB825",
-                    React.createElement("input", { ref: batchInputRef, type: "file", accept: "image/*", onChange: handleBatchUpload, style: { display: "none" }, disabled: batchBusy })),
+                    React.createElement("input", { ref: batchInputRef, type: "file", accept: "image/*", multiple: true, onChange: handleBatchUpload, style: { display: "none" }, disabled: batchBusy })),
+                React.createElement("span", { className: "text-xs", style: { color: C.muted } },
+                    "\uC0AC\uC9C4 \uC5EC\uB7EC \uC7A5 \uD55C\uAEBC\uBC88\uC5D0 \uC120\uD0DD\uD560 \uC218 \uC788\uC5B4\uC694",
+                    IS_DESKTOP ? " · 캡처한 화면은 Ctrl+V 로 바로 붙여넣기" : ""),
                 !cfg.geminiKey && (React.createElement("button", { onClick: onOpenSettings, className: "text-xs underline", style: { color: C.accent } }, "Gemini API \uD0A4 \uC124\uC815\uD558\uAE30")),
                 ocrError && React.createElement("span", { className: "text-xs", style: { color: C.negative } }, ocrError),
                 batchError && React.createElement("div", { className: "text-xs w-full mt-2 p-3 rounded-lg", style: { color: C.negative, background: C.negativeSoft, wordBreak: "break-word", whiteSpace: "pre-wrap", fontFamily: "monospace", fontSize: 11 } }, batchError),
                 ocrSuccess && !ocrBusy && React.createElement("span", { className: "text-xs", style: { color: C.positive } }, "\uC790\uB3D9 \uC785\uB825 \uC644\uB8CC \u2014 \uD655\uC778 \uD6C4 \uCD94\uAC00\uB97C \uB20C\uB7EC\uC8FC\uC138\uC694"),
                 (ocrBusy || batchBusy) && (React.createElement("div", { className: "w-full" },
-                    React.createElement(AiProgress, { stage: aiStage || "AI 가 읽는 중", startedAt: aiStartedAt, expectedMs: batchBusy ? 18000 : 9000, note: batchBusy
-                            ? "거래가 많으면 20초 이상 걸리기도 합니다. 창을 닫지 말고 기다려주세요."
+                    React.createElement(AiProgress, { stage: aiStage || "AI 가 읽는 중", startedAt: aiStartedAt, expectedMs: batchBusy ? 18000 * Math.max(1, (batchCount && batchCount.total) || 1) : 9000, note: batchBusy
+                            ? (batchCount && batchCount.total > 1
+                                ? `사진 ${batchCount.total}장을 차례로 읽고 있어요 (${batchCount.done}/${batchCount.total} 완료). 창을 닫지 말고 기다려주세요.`
+                                : "거래가 많으면 20초 이상 걸리기도 합니다. 창을 닫지 말고 기다려주세요.")
                             : "보통 5~15초 걸립니다. 창을 닫지 말고 기다려주세요." })))),
             React.createElement("div", { className: "mb-3", style: { maxWidth: 320 } },
                 React.createElement(PocketToggle, { value: form.pocket, onChange: (v) => setForm({ ...form, pocket: v }) })),
