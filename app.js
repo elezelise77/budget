@@ -14,7 +14,7 @@ const GEMINI_MODEL = "gemini-3.6-flash";
 // 휴대폰용 웹 주소. 빌드할 때 app.config.json 의 mobileWebUrl 값이 여기에 들어간다.
 // (소스를 직접 고칠 필요 없이 app.config.json 만 수정하면 된다.)
 const MOBILE_WEB_URL = "https://elezelise77.github.io/budget/";
-const APP_VERSION = "1.5.1"; // 빌드할 때 package.json 의 version 이 들어간다
+const APP_VERSION = "1.6.0"; // 빌드할 때 package.json 의 version 이 들어간다
 function mobileLink(pairCode) {
     if (!MOBILE_WEB_URL)
         return "";
@@ -377,9 +377,32 @@ async function callGeminiDirect(apiKey, model, promptText, base64, mimeType) {
         throw new Error("[EMPTY_TEXT] Gemini가 텍스트를 반환하지 않았습니다.");
     return rawText;
 }
+// 구글 AI 가 혼잡할 때 나는 오류인지 (잠깐 기다렸다 다시 하면 되는 종류)
+function isBusyError(msg) {
+    return /high demand|overloaded|UNAVAILABLE|RESOURCE_EXHAUSTED|try again later|rate limit|429|503/i.test(String(msg || ""));
+}
+// 쓰고 있는 모델이 계속 혼잡하면, 계정에서 쓸 수 있는 다른 flash 모델을 물어봐서 그걸로 한 번 더 해본다.
+// 모델 이름을 코드에 박아두면 언젠가 없어지므로, 목록을 직접 받아서 고른다.
+async function pickAlternateModel(apiKey, current) {
+    try {
+        const json = await httpJson(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`, {}, 15000);
+        const list = (json && json.models) || [];
+        const usable = list
+            .filter((m) => (m.supportedGenerationMethods || []).indexOf("generateContent") !== -1)
+            .map((m) => String(m.name || "").replace(/^models\//, ""))
+            .filter((n) => n && n !== current && /flash/i.test(n) && !/thinking|audio|tts|image|embedding|live/i.test(n));
+        // 최신(이름이 큰) 것부터
+        usable.sort((a, b) => b.localeCompare(a, "en", { numeric: true }));
+        return usable[0] || null;
+    }
+    catch (e) {
+        return null;
+    }
+}
 async function callGeminiWithRetry(apiKey, model, prompt, base64, mimeType, onAttempt) {
+    const waits = [3000, 7000, 15000]; // 혼잡할수록 점점 더 기다린다
     let lastErr;
-    for (let attempt = 0; attempt <= 2; attempt++) {
+    for (let attempt = 0; attempt <= waits.length; attempt++) {
         try {
             if (onAttempt)
                 onAttempt(attempt);
@@ -389,12 +412,29 @@ async function callGeminiWithRetry(apiKey, model, prompt, base64, mimeType, onAt
             lastErr = err;
             if (err.name === "AbortError")
                 throw err;
-            if (/high demand|GEMINI_ERROR/i.test(err.message) && attempt < 2) {
-                await new Promise((r) => setTimeout(r, 4000));
+            if (isBusyError(err.message) && attempt < waits.length) {
+                await new Promise((r) => setTimeout(r, waits[attempt]));
                 continue;
             }
-            throw err;
+            break;
         }
+    }
+    // 끝까지 혼잡하면 다른 모델로 한 번 더
+    if (isBusyError(lastErr && lastErr.message)) {
+        const alt = await pickAlternateModel(apiKey, model);
+        if (alt) {
+            if (onAttempt)
+                onAttempt(-1, alt);
+            try {
+                return await callGeminiDirect(apiKey, alt, prompt, base64, mimeType);
+            }
+            catch (e2) {
+                lastErr = e2;
+            }
+        }
+        const e = new Error("구글 AI 서버가 지금 많이 붐빕니다. 1~2분 뒤에 다시 눌러주세요. (사진을 한 장씩 올리면 성공할 때가 많습니다)");
+        e.busy = true;
+        throw e;
     }
     throw lastErr;
 }
@@ -3302,7 +3342,7 @@ function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTran
             }
             const { base64, mimeType } = await fileToResizedBase64(file);
             setAiStage("AI 가 영수증을 읽는 중");
-            const rawText = await callGeminiWithRetry(cfg.geminiKey, GEMINI_MODEL, buildReceiptPrompt(todayStr()), base64, mimeType, (n) => setAiStage(n === 0 ? "AI 가 영수증을 읽는 중" : `혼잡해서 다시 시도하는 중 (${n + 1}/3)`));
+            const rawText = await callGeminiWithRetry(cfg.geminiKey, GEMINI_MODEL, buildReceiptPrompt(todayStr()), base64, mimeType, (n, alt) => setAiStage(n === -1 ? `다른 모델(${alt})로 다시 시도하는 중` : n === 0 ? "AI 가 영수증을 읽는 중" : `구글 AI 가 붐벼서 기다렸다 다시 시도하는 중 (${n + 1}/4)`));
             setAiStage("결과를 정리하는 중");
             const ex = JSON.parse(extractJsonFromText(rawText, "{", "}"));
             const exType = ex.type === "income" ? "income" : "expense";
@@ -3348,7 +3388,7 @@ function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTran
                 try {
                     const { base64, mimeType } = await fileToResizedBase64(list[i], 1800, 0.85);
                     setAiStage(`AI 가 거래내역을 읽는 중${nth}`);
-                    const rawText = await callGeminiWithRetry(cfg.geminiKey, GEMINI_MODEL, buildBatchPrompt(todayStr()), base64, mimeType, (n) => setAiStage(n === 0 ? `AI 가 거래내역을 읽는 중${nth}` : `혼잡해서 다시 시도하는 중${nth} (${n + 1}/3)`));
+                    const rawText = await callGeminiWithRetry(cfg.geminiKey, GEMINI_MODEL, buildBatchPrompt(todayStr()), base64, mimeType, (n, alt) => setAiStage(n === -1 ? `다른 모델(${alt})로 다시 시도하는 중${nth}` : n === 0 ? `AI 가 거래내역을 읽는 중${nth}` : `구글 AI 가 붐벼서 기다렸다 다시 시도하는 중${nth} (${n + 1}/4)`));
                     let arr = JSON.parse(extractJsonFromText(rawText, "[", "]"));
                     arr = Array.isArray(arr) ? arr : [arr];
                     for (const it of arr)
@@ -3555,7 +3595,7 @@ function ExpensesTab({ transactions, addTransaction, addTransactions, deleteTran
                 batchError && React.createElement("div", { className: "text-xs w-full mt-2 p-3 rounded-lg", style: { color: C.negative, background: C.negativeSoft, wordBreak: "break-word", whiteSpace: "pre-wrap", fontFamily: "monospace", fontSize: 11 } }, batchError),
                 ocrSuccess && !ocrBusy && React.createElement("span", { className: "text-xs", style: { color: C.positive } }, "\uC790\uB3D9 \uC785\uB825 \uC644\uB8CC \u2014 \uD655\uC778 \uD6C4 \uCD94\uAC00\uB97C \uB20C\uB7EC\uC8FC\uC138\uC694"),
                 (ocrBusy || batchBusy) && (React.createElement("div", { className: "w-full" },
-                    React.createElement(AiProgress, { stage: aiStage || "AI 가 읽는 중", startedAt: aiStartedAt, expectedMs: batchBusy ? 18000 * Math.max(1, (batchCount && batchCount.total) || 1) : 9000, note: batchBusy
+                    React.createElement(AiProgress, { stage: aiStage || "AI 가 읽는 중", startedAt: aiStartedAt, expectedMs: batchBusy ? 20000 * Math.max(1, (batchCount && batchCount.total) || 1) : 10000, note: batchBusy
                             ? (batchCount && batchCount.total > 1
                                 ? `사진 ${batchCount.total}장을 차례로 읽고 있어요 (${batchCount.done}/${batchCount.total} 완료). 창을 닫지 말고 기다려주세요.`
                                 : "거래가 많으면 20초 이상 걸리기도 합니다. 창을 닫지 말고 기다려주세요.")
